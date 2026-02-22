@@ -49,6 +49,7 @@ class Settings:
 
     fee_bps: float
     slippage_bps: float
+    heartbeat_interval: int
 
     @property
     def is_live(self) -> bool:
@@ -83,4 +84,5 @@ def load_settings() -> Settings:
         take_profit_r=_as_float("TAKE_PROFIT_R", 1.5),
         fee_bps=_as_float("FEE_BPS", 6),
         slippage_bps=_as_float("SLIPPAGE_BPS", 2),
+        heartbeat_interval=max(1, _as_int("HEARTBEAT_INTERVAL", 1)),
     )

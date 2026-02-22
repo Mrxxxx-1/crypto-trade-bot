@@ -52,6 +52,11 @@ class PaperBroker:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload) + "\n")
 
+    def log_event(self, event: str, payload: dict) -> None:
+        record = {"ts": self._now().isoformat(), "event": event}
+        record.update(payload)
+        self._write_jsonl("events.jsonl", record)
+
     def _execution_price(self, last_price: float, side: Side) -> float:
         slip = self.settings.slippage_bps / 10_000
         if side == "buy":
@@ -87,11 +92,9 @@ class PaperBroker:
             opened_at=self._now(),
         )
         self.positions[symbol] = pos
-        self._write_jsonl(
-            "events.jsonl",
+        self.log_event(
+            "position_open",
             {
-                "ts": self._now().isoformat(),
-                "event": "position_open",
                 "symbol": symbol,
                 "side": side,
                 "size": size,
@@ -137,6 +140,19 @@ class PaperBroker:
         payload["closed_at"] = trade.closed_at.isoformat()
         payload["equity"] = self.equity
         self._write_jsonl("trades.jsonl", payload)
+        self.log_event(
+            "position_close",
+            {
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "size": trade.size,
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "pnl": trade.pnl,
+                "fees": trade.fees,
+                "equity": self.equity,
+            },
+        )
         return trade
 
     def maybe_force_exit_by_risk(self, symbol: str) -> Optional[TradeResult]:

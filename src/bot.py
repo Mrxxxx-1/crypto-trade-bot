@@ -23,6 +23,7 @@ class FuturesBot:
         self.risk = RiskManager(settings)
         self.broker = PaperBroker(settings, self.exchange)
         self.states: Dict[str, SymbolState] = {symbol: SymbolState() for symbol in settings.symbols}
+        self.loop_count = 0
 
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -40,29 +41,38 @@ class FuturesBot:
             take = price - (stop_distance * self.settings.take_profit_r)
         return stop, take
 
-    def _process_symbol(self, symbol: str) -> None:
+    def _process_symbol(self, symbol: str) -> str:
         ohlcv = self.exchange.fetch_ohlcv(symbol, self.settings.timeframe, self.settings.lookback_candles)
         signal, atr = generate_signal(ohlcv, self.settings)
         last_price = float(ohlcv[-1][4])
+        atr_pct = (atr / last_price * 100) if last_price > 0 else 0.0
 
         # Exit checks first for active positions.
         closed_by_risk = self.broker.maybe_force_exit_by_risk(symbol)
         if closed_by_risk is not None:
             self.risk.on_trade_close(closed_by_risk.pnl, self.broker.equity)
             print(f"[{self._utc_now()}] EXIT {symbol} pnl={closed_by_risk.pnl:.2f} equity={self.broker.equity:.2f}")
+            self.broker.log_event(
+                "risk_exit",
+                {"symbol": symbol, "pnl": closed_by_risk.pnl, "equity": self.broker.equity},
+            )
 
         if symbol in self.broker.positions:
-            return
+            pos = self.broker.positions[symbol]
+            return (
+                f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
+                f"last={last_price:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f}"
+            )
         if signal == "flat" or atr <= 0:
-            return
+            return f"{symbol} no_entry signal={signal} atr_pct={atr_pct:.3f} last={last_price:.2f}"
         if not self.risk.can_trade(self.broker.equity):
             print(f"[{self._utc_now()}] HALT risk guard active, no new trades")
-            return
+            return f"{symbol} blocked_by_risk signal={signal} atr_pct={atr_pct:.3f}"
 
         stop_price, take_price = self._stops(signal, last_price, atr)
         size = self.risk.calc_position_size(self.broker.equity, last_price, stop_price)
         if size <= 0:
-            return
+            return f"{symbol} no_entry size=0 signal={signal} atr_pct={atr_pct:.3f}"
         side = self._entry_side(signal)
         pos = self.broker.open_position(
             symbol=symbol,
@@ -76,13 +86,36 @@ class FuturesBot:
                 f"[{self._utc_now()}] OPEN {symbol} {side} size={size:.6f} entry={pos.entry_price:.2f} "
                 f"stop={stop_price:.2f} tp={take_price:.2f} equity={self.broker.equity:.2f}"
             )
+            return (
+                f"{symbol} opened side={side} size={size:.6f} entry={pos.entry_price:.2f} "
+                f"stop={stop_price:.2f} tp={take_price:.2f}"
+            )
+        return f"{symbol} no_entry signal={signal} atr_pct={atr_pct:.3f} last={last_price:.2f}"
 
     def run_forever(self) -> None:
         print(f"[{self._utc_now()}] Start bot mode={self.settings.mode} symbols={self.settings.symbols}")
         while True:
             try:
+                self.loop_count += 1
+                statuses = []
                 for symbol in self.settings.symbols:
-                    self._process_symbol(symbol)
+                    statuses.append(self._process_symbol(symbol))
+                if self.loop_count % self.settings.heartbeat_interval == 0:
+                    print(
+                        f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} equity={self.broker.equity:.2f} "
+                        f"open_positions={len(self.broker.positions)}"
+                    )
+                    for status in statuses:
+                        print(f"  - {status}")
+                    self.broker.log_event(
+                        "heartbeat",
+                        {
+                            "loop": self.loop_count,
+                            "equity": self.broker.equity,
+                            "open_positions": len(self.broker.positions),
+                            "statuses": statuses,
+                        },
+                    )
                 time.sleep(self.settings.poll_seconds)
             except KeyboardInterrupt:
                 print("Stopped by user.")

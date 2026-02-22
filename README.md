@@ -95,6 +95,7 @@ Key vars:
 - `SYMBOLS`: comma-separated list
 - `TIMEFRAME`: default `5m`
 - `POLL_SECONDS`: default `20`
+- `HEARTBEAT_INTERVAL`: print/log status every N loops (default `1`)
 - `RISK_PER_TRADE_PCT`
 - `MAX_DAILY_LOSS_PCT`
 - `MAX_CONSECUTIVE_LOSSES`
