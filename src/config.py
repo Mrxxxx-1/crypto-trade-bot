@@ -46,9 +46,15 @@ class Settings:
     atr_min_pct: float
     stop_atr_multiplier: float
     take_profit_r: float
+    cooldown_candles: int
 
-    fee_bps: float
+    htf_timeframe: str
+    volume_min_mult: float
+
+    entry_fee_bps: float
+    exit_fee_bps: float
     slippage_bps: float
+    limit_timeout_seconds: int
     heartbeat_interval: int
 
     @property
@@ -82,7 +88,12 @@ def load_settings() -> Settings:
         atr_min_pct=_as_float("ATR_MIN_PCT", 0.2),
         stop_atr_multiplier=_as_float("STOP_ATR_MULTIPLIER", 1.8),
         take_profit_r=_as_float("TAKE_PROFIT_R", 1.5),
-        fee_bps=_as_float("FEE_BPS", 6),
+        cooldown_candles=_as_int("COOLDOWN_CANDLES", 0),
+        htf_timeframe=os.getenv("HTF_TIMEFRAME", "1h"),
+        volume_min_mult=_as_float("VOLUME_MIN_MULT", 0.0),
+        entry_fee_bps=_as_float("ENTRY_FEE_BPS", 2),
+        exit_fee_bps=_as_float("EXIT_FEE_BPS", 5),
         slippage_bps=_as_float("SLIPPAGE_BPS", 2),
+        limit_timeout_seconds=_as_int("LIMIT_TIMEOUT_SECONDS", 30),
         heartbeat_interval=max(1, _as_int("HEARTBEAT_INTERVAL", 1)),
     )

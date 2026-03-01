@@ -30,3 +30,15 @@ class TradeResult:
     fees: float
     opened_at: datetime
     closed_at: datetime
+
+
+@dataclass
+class PendingOrder:
+    symbol: str
+    side: Side
+    size: float
+    limit_price: float
+    stop_price: float
+    take_profit_price: float
+    placed_at: datetime
+    order_id: str = ""

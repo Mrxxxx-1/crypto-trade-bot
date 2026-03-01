@@ -23,7 +23,12 @@ class RiskManager:
     def _roll_day_if_needed(self, equity: float) -> None:
         today = date.today()
         if today != self.state.day:
-            self.state = RiskState(day=today, day_start_equity=equity)
+            carry = self.state.consecutive_losses
+            self.state = RiskState(
+                day=today,
+                day_start_equity=equity,
+                consecutive_losses=carry,
+            )
 
     def can_trade(self, equity: float) -> bool:
         self._roll_day_if_needed(equity)

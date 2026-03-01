@@ -52,3 +52,30 @@ def generate_signal(ohlcv: List[List[float]], settings: Settings) -> Tuple[Signa
     if fast < slow:
         return "short", atr_value
     return "flat", atr_value
+
+
+def htf_trend(htf_ohlcv: List[List[float]], settings: Settings) -> Signal:
+    """Return the higher-timeframe trend direction using the same EMA logic."""
+    closes = [float(c[4]) for c in htf_ohlcv]
+    if len(closes) < max(settings.fast_ema, settings.slow_ema) + 2:
+        return "flat"
+    fast = _ema(closes[-settings.fast_ema :], settings.fast_ema)
+    slow = _ema(closes[-settings.slow_ema :], settings.slow_ema)
+    if fast > slow:
+        return "long"
+    if fast < slow:
+        return "short"
+    return "flat"
+
+
+def volume_ok(ohlcv: List[List[float]], period: int, min_mult: float) -> bool:
+    """Return True if the latest candle's volume meets the minimum threshold."""
+    if min_mult <= 0:
+        return True
+    if len(ohlcv) < period + 1:
+        return True
+    volumes = [float(c[5]) for c in ohlcv[-(period + 1) :]]
+    avg_vol = sum(volumes[:-1]) / max(len(volumes) - 1, 1)
+    if avg_vol <= 0:
+        return True
+    return volumes[-1] >= avg_vol * min_mult

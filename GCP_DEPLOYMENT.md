@@ -37,7 +37,7 @@ sudo ufw enable
 
 Use one of these:
 
-- `git clone <your-repo-url>`
+- `git clone https://github.com/Mrxxxx-1/crypto-trade-bot.git`
 - or upload the local folder with `scp`/`rsync`
 
 Then enter the project directory:
