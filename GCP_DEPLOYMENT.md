@@ -173,6 +173,73 @@ Pass criteria:
 - risk guardrails fire as expected: timer halts (consecutive-loss / daily-loss), candle cooldown after stop exits, closed-candle signals, high/low exit checks
 - drawdown and consistency are within your plan
 
+## 11) Clean re-clone + start newest version
+
+Use this when you want a fully fresh deployment from the latest repo.
+
+1) Stop the running bot service:
+
+```bash
+sudo systemctl stop crypto-bot || true
+sudo systemctl disable crypto-bot || true
+```
+
+2) Backup current config and logs:
+
+```bash
+cd ~
+cp ~/crypto-trade-bot/.env ~/bot-env-backup-$(date +%F-%H%M).env 2>/dev/null || true
+mkdir -p ~/bot-log-backup
+cp -r ~/crypto-trade-bot/logs ~/bot-log-backup/logs-$(date +%F-%H%M) 2>/dev/null || true
+```
+
+3) Delete old repo and clone latest:
+
+```bash
+rm -rf ~/crypto-trade-bot
+git clone https://github.com/Mrxxxx-1/crypto-trade-bot.git ~/crypto-trade-bot
+cd ~/crypto-trade-bot
+```
+
+4) Recreate venv and install requirements:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+5) Restore `.env` (or use paper defaults) and run smoke test:
+
+```bash
+cp ~/bot-env-backup-*.env .env 2>/dev/null || cp .env.production-paper .env
+mkdir -p logs
+python -m src.main
+```
+
+Wait for startup/heartbeat output, then stop with `Ctrl+C`.
+
+6) Start service again:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable crypto-bot
+sudo systemctl start crypto-bot
+systemctl status crypto-bot
+journalctl -u crypto-bot -f
+```
+
+Quick update-only path (no delete/re-clone):
+
+```bash
+cd ~/crypto-trade-bot
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart crypto-bot
+```
+
 ## Troubleshooting
 
 - **No output in terminal:** check heartbeat setting and `POLL_SECONDS`.
