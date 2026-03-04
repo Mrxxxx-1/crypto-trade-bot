@@ -5,7 +5,6 @@ Usage:
     python -m src.backtest                               # baseline run
     python -m src.backtest --set TAKE_PROFIT_R=1.0       # test a parameter tweak
     python -m src.backtest --cooldown 6                  # require 6-candle wait after exit
-    python -m src.backtest --carry-losses                # don't reset loss streak at midnight
     python -m src.backtest --label IMPROVED --env .env.improved
 """
 from __future__ import annotations
@@ -14,7 +13,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -67,40 +66,41 @@ class BTResult:
 # ---------------------------------------------------------------------------
 
 class BacktestRisk:
-    def __init__(self, settings: Settings, *, carry_losses: bool = False) -> None:
+    """Backtest-side risk manager; uses candle timestamps for halt timers
+    instead of wall-clock time (mirrors ``RiskManager`` semantics).
+    """
+
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.day: Optional[date] = None
-        self.day_start_equity: float = settings.initial_equity
+        self.window_start_equity: float = settings.initial_equity
         self.consecutive_losses: int = 0
-        self.halted: bool = False
-        self.carry_losses = carry_losses
+        self.halted_until: Optional[datetime] = None
 
-    def _roll_day(self, current_date: date, equity: float) -> None:
-        if self.day != current_date:
-            self.day = current_date
-            self.day_start_equity = equity
-            self.halted = False
-            if not self.carry_losses:
-                self.consecutive_losses = 0
+    def _check_halt_expired(self, candle_time: datetime, equity: float) -> None:
+        if self.halted_until is not None and candle_time >= self.halted_until:
+            self.halted_until = None
+            self.consecutive_losses = 0
+            self.window_start_equity = equity
 
-    def can_trade(self, current_date: date, equity: float) -> bool:
-        self._roll_day(current_date, equity)
-        if self.halted:
+    def can_trade(self, candle_time: datetime, equity: float) -> bool:
+        self._check_halt_expired(candle_time, equity)
+
+        if self.halted_until is not None:
             return False
 
-        dd_pct = ((self.day_start_equity - equity) / max(self.day_start_equity, 1e-9)) * 100
+        dd_pct = ((self.window_start_equity - equity) / max(self.window_start_equity, 1e-9)) * 100
         if dd_pct >= self.settings.max_daily_loss_pct:
-            self.halted = True
+            self.halted_until = candle_time + timedelta(hours=self.settings.daily_loss_halt_hours)
             return False
 
         if self.consecutive_losses >= self.settings.max_consecutive_losses:
-            self.halted = True
+            self.halted_until = candle_time + timedelta(hours=self.settings.consec_halt_hours)
             return False
 
         return True
 
-    def on_trade_close(self, current_date: date, pnl: float, equity: float) -> None:
-        self._roll_day(current_date, equity)
+    def on_trade_close(self, candle_time: datetime, pnl: float, equity: float) -> None:
+        self._check_halt_expired(candle_time, equity)
         if pnl < 0:
             self.consecutive_losses += 1
         else:
@@ -138,9 +138,17 @@ def run_backtest(
     candles_by_symbol: Dict[str, List[list]],
     *,
     cooldown_candles: int = 0,
-    carry_losses: bool = False,
     htf_candles_by_symbol: Optional[Dict[str, List[list]]] = None,
 ) -> BTResult:
+    """Replay candles through the strategy.
+
+    Behaviour matches the live bot:
+    - Exits via candle high/low against stop/TP levels.
+    - Skips exit check on the entry candle.
+    - Signals generated from closed candles only.
+    - Cooldown (candle-count) after stop exits, same-direction only.
+    - Timer-based halts (``consec_halt_hours``, ``daily_loss_halt_hours``).
+    """
     min_len = min(len(v) for v in candles_by_symbol.values())
     for sym in list(candles_by_symbol):
         candles_by_symbol[sym] = candles_by_symbol[sym][-min_len:]
@@ -148,7 +156,7 @@ def run_backtest(
     equity = settings.initial_equity
     positions: Dict[str, BTPosition] = {}
     trades: List[BTTrade] = []
-    risk = BacktestRisk(settings, carry_losses=carry_losses)
+    risk = BacktestRisk(settings)
     lookback = settings.lookback_candles
     last_exit_candle: Dict[str, int] = {}
     last_exit_signal: Dict[str, str] = {}
@@ -162,7 +170,6 @@ def run_backtest(
         candle_ts = datetime.fromtimestamp(
             candles_by_symbol[ref_symbol][i][0] / 1000, tz=timezone.utc
         )
-        candle_date = candle_ts.date()
 
         for symbol in settings.symbols:
             candle = candles_by_symbol[symbol][i]
@@ -211,7 +218,7 @@ def run_backtest(
                         exit_reason=reason,
                     ))
                     del positions[symbol]
-                    risk.on_trade_close(candle_date, net_pnl, equity)
+                    risk.on_trade_close(candle_ts, net_pnl, equity)
                     if reason == "stop":
                         last_exit_candle[symbol] = i
                         last_exit_signal[symbol] = pos.side
@@ -239,7 +246,7 @@ def run_backtest(
                 if htf != signal:
                     continue
 
-            if not risk.can_trade(candle_date, equity):
+            if not risk.can_trade(candle_ts, equity):
                 continue
 
             if cooldown_candles > 0 and symbol in last_exit_candle:
@@ -360,6 +367,7 @@ _SETTINGS_FLOATS = {
     "INITIAL_EQUITY", "TARGET_LEVERAGE", "MAX_LEVERAGE", "RISK_PER_TRADE_PCT",
     "MAX_DAILY_LOSS_PCT", "ATR_MIN_PCT", "STOP_ATR_MULTIPLIER", "TAKE_PROFIT_R",
     "ENTRY_FEE_BPS", "EXIT_FEE_BPS", "SLIPPAGE_BPS", "VOLUME_MIN_MULT",
+    "CONSEC_HALT_HOURS", "DAILY_LOSS_HALT_HOURS",
 }
 _SETTINGS_INTS = {
     "POLL_SECONDS", "LOOKBACK_CANDLES", "MAX_CONSECUTIVE_LOSSES",
@@ -393,10 +401,8 @@ def main() -> None:
     parser.add_argument("--label", default="BACKTEST", help="Label for the report header")
     parser.add_argument("--set", nargs="*", default=[], dest="overrides",
                         help="Override settings, e.g. --set TAKE_PROFIT_R=1.0 ATR_MIN_PCT=0.15")
-    parser.add_argument("--cooldown", type=int, default=0,
-                        help="Candles to wait after stop-out before same-direction re-entry (0=off)")
-    parser.add_argument("--carry-losses", action="store_true", default=False,
-                        help="Don't reset consecutive loss counter at midnight")
+    parser.add_argument("--cooldown", type=int, default=None,
+                        help="Override COOLDOWN_CANDLES from env (default: use env value)")
     args = parser.parse_args()
 
     load_dotenv(args.env, override=True)
@@ -434,22 +440,21 @@ def main() -> None:
                 htf_candles_by_symbol = None
                 break
 
+    cooldown = args.cooldown if args.cooldown is not None else settings.cooldown_candles
+
     flags: list[str] = []
-    if args.cooldown:
-        flags.append(f"cooldown={args.cooldown}")
-    if args.carry_losses:
-        flags.append("carry-losses")
+    flags.append(f"cooldown={cooldown}")
     if htf_candles_by_symbol:
         flags.append(f"htf={settings.htf_timeframe}")
     if settings.volume_min_mult > 0:
         flags.append(f"vol>={settings.volume_min_mult}x")
-    if flags:
-        print(f"Flags: {', '.join(flags)}")
+    flags.append(f"consec_halt={settings.consec_halt_hours}h")
+    flags.append(f"daily_halt={settings.daily_loss_halt_hours}h")
+    print(f"Flags: {', '.join(flags)}")
 
     result = run_backtest(
         settings, candles_by_symbol,
-        cooldown_candles=args.cooldown,
-        carry_losses=args.carry_losses,
+        cooldown_candles=cooldown,
         htf_candles_by_symbol=htf_candles_by_symbol,
     )
     print_report(result, label=args.label)

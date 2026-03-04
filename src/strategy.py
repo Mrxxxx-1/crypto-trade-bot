@@ -1,3 +1,9 @@
+"""EMA crossover + ATR volatility filter strategy.
+
+``generate_signal`` expects **closed candles only** (the forming candle must
+be excluded by the caller).  ``htf_trend`` applies the same EMA logic on a
+higher-timeframe series; ``volume_ok`` gates entries on minimum volume.
+"""
 from __future__ import annotations
 
 from typing import List, Tuple
@@ -31,6 +37,11 @@ def _atr(ohlcv: List[List[float]], period: int) -> float:
 
 
 def generate_signal(ohlcv: List[List[float]], settings: Settings) -> Tuple[Signal, float]:
+    """Return ``(signal, atr)`` from closed candle data.
+
+    Long when fast EMA > slow EMA, short when fast < slow.
+    Returns ``("flat", atr)`` when ATR < ``atr_min_pct`` or data is too short.
+    """
     closes = [float(c[4]) for c in ohlcv]
     if len(closes) < max(settings.fast_ema, settings.slow_ema) + 2:
         return "flat", 0.0

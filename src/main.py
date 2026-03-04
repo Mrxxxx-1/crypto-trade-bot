@@ -1,3 +1,7 @@
+"""Entry point: load settings and run the paper futures bot.
+
+Live mode is intentionally disabled in this MVP -- set MODE=paper.
+"""
 from __future__ import annotations
 
 from .bot import FuturesBot

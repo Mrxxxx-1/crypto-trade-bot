@@ -22,6 +22,7 @@ def fetch_symbol(
     since_ms: int,
     limit_per_req: int = 100,
 ) -> list[list]:
+    """Paginate OHLCV from OKX, deduplicate, and return sorted candles."""
     all_candles: list[list] = []
     cursor = since_ms
 

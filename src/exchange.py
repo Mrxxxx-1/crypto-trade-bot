@@ -1,3 +1,9 @@
+"""OKX exchange adapter (via ccxt) and paper broker for simulated execution.
+
+``ExchangeAdapter`` wraps ccxt for OHLCV, ticker, and order calls.
+``PaperBroker`` simulates limit entries, fill checks, fee/slippage, and
+writes trade + event logs to ``logs/``.
+"""
 from __future__ import annotations
 
 import json
@@ -13,6 +19,7 @@ from .models import PendingOrder, Position, Side, TradeResult
 
 
 class ExchangeAdapter:
+    """Thin ccxt wrapper for OKX: OHLCV, ticker, and order operations."""
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.client = ccxt.okx(
@@ -45,6 +52,8 @@ class ExchangeAdapter:
 
 
 class PaperBroker:
+    """Simulated execution engine: equity tracking, limit fills, fee/slippage, and JSONL logging."""
+
     def __init__(self, settings: Settings, exchange: ExchangeAdapter) -> None:
         self.settings = settings
         self.exchange = exchange
@@ -73,12 +82,6 @@ class PaperBroker:
     def _exit_fee(self, notional: float) -> float:
         return notional * (self.settings.exit_fee_bps / 10_000)
 
-    def _exit_price_with_slippage(self, last_price: float, side: Side) -> float:
-        slip = self.settings.slippage_bps / 10_000
-        if side == "buy":
-            return last_price * (1 + slip)
-        return last_price * (1 - slip)
-
     # ------------------------------------------------------------------
     # Limit entry flow
     # ------------------------------------------------------------------
@@ -92,6 +95,7 @@ class PaperBroker:
         stop_price: float,
         take_profit_price: float,
     ) -> Optional[PendingOrder]:
+        """Queue a limit entry.  Returns None if size<=0, already positioned, or pending."""
         if size <= 0 or symbol in self.positions or symbol in self.pending_orders:
             return None
         order = PendingOrder(
@@ -160,6 +164,7 @@ class PaperBroker:
         return False
 
     def is_pending_expired(self, symbol: str) -> bool:
+        """True if the pending order has exceeded ``LIMIT_TIMEOUT_SECONDS``."""
         order = self.pending_orders.get(symbol)
         if not order:
             return False
@@ -167,16 +172,24 @@ class PaperBroker:
         return elapsed >= self.settings.limit_timeout_seconds
 
     # ------------------------------------------------------------------
-    # Close / exit (unchanged: market order with taker fee + slippage)
+    # Close at exact price level (matches backtest exit model)
     # ------------------------------------------------------------------
 
-    def close_position(self, symbol: str, last_price: Optional[float] = None) -> Optional[TradeResult]:
+    def close_position_at(
+        self, symbol: str, exit_at: float, exit_reason: str,
+    ) -> Optional[TradeResult]:
+        """Close position at an exact stop/TP level with slippage applied."""
         pos = self.positions.get(symbol)
         if not pos:
             return None
+
         exit_side: Side = "sell" if pos.side == "buy" else "buy"
-        last = last_price if last_price is not None else self.exchange.fetch_last_price(symbol)
-        exit_px = self._exit_price_with_slippage(last, exit_side)
+        slip = self.settings.slippage_bps / 10_000
+        if exit_side == "buy":
+            exit_px = exit_at * (1 + slip)
+        else:
+            exit_px = exit_at * (1 - slip)
+
         notional = exit_px * pos.size
         fee = self._exit_fee(notional)
 
@@ -196,6 +209,7 @@ class PaperBroker:
             fees=fee,
             opened_at=pos.opened_at,
             closed_at=self._now(),
+            exit_reason=exit_reason,
         )
         del self.positions[symbol]
         payload = asdict(trade)
@@ -207,18 +221,6 @@ class PaperBroker:
             "symbol": trade.symbol, "side": trade.side, "size": trade.size,
             "entry_price": trade.entry_price, "exit_price": trade.exit_price,
             "pnl": trade.pnl, "fees": trade.fees, "equity": self.equity,
+            "exit_reason": exit_reason,
         })
         return trade
-
-    def maybe_force_exit_by_risk(self, symbol: str) -> Optional[TradeResult]:
-        pos = self.positions.get(symbol)
-        if not pos:
-            return None
-        last = self.exchange.fetch_last_price(symbol)
-        if pos.side == "buy":
-            if last <= pos.stop_price or last >= pos.take_profit_price:
-                return self.close_position(symbol, last_price=last)
-        else:
-            if last >= pos.stop_price or last <= pos.take_profit_price:
-                return self.close_position(symbol, last_price=last)
-        return None

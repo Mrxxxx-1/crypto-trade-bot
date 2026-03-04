@@ -1,3 +1,8 @@
+"""Load bot configuration from environment variables (via ``python-dotenv``).
+
+``Settings`` is a frozen dataclass consumed by the bot, exchange, risk, and
+strategy modules.  Defaults are suitable for paper trading on 5m candles.
+"""
 from __future__ import annotations
 
 import os
@@ -46,10 +51,13 @@ class Settings:
     atr_min_pct: float
     stop_atr_multiplier: float
     take_profit_r: float
-    cooldown_candles: int
+    cooldown_candles: int  # candles to wait after a stop exit before same-direction re-entry
 
     htf_timeframe: str
     volume_min_mult: float
+
+    consec_halt_hours: float  # hours to halt after max consecutive losses
+    daily_loss_halt_hours: float  # hours to halt after rolling drawdown breach
 
     entry_fee_bps: float
     exit_fee_bps: float
@@ -63,6 +71,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    """Load ``.env``, parse every variable with its documented default, return Settings."""
     load_dotenv()
 
     symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC-USDT-SWAP,ETH-USDT-SWAP").split(",") if s.strip()]
@@ -91,6 +100,8 @@ def load_settings() -> Settings:
         cooldown_candles=_as_int("COOLDOWN_CANDLES", 0),
         htf_timeframe=os.getenv("HTF_TIMEFRAME", "1h"),
         volume_min_mult=_as_float("VOLUME_MIN_MULT", 0.0),
+        consec_halt_hours=_as_float("CONSEC_HALT_HOURS", 6),
+        daily_loss_halt_hours=_as_float("DAILY_LOSS_HALT_HOURS", 12),
         entry_fee_bps=_as_float("ENTRY_FEE_BPS", 2),
         exit_fee_bps=_as_float("EXIT_FEE_BPS", 5),
         slippage_bps=_as_float("SLIPPAGE_BPS", 2),

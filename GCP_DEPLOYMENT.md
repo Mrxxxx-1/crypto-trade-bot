@@ -65,6 +65,7 @@ Verify `.env` contains:
 
 - `MODE=paper`
 - `HEARTBEAT_INTERVAL` set as desired (`1` verbose, `3` quieter)
+- `CONSEC_HALT_HOURS=6` and `DAILY_LOSS_HALT_HOURS=12` (safe defaults)
 
 ## 6) Smoke test manually
 
@@ -169,7 +170,7 @@ Pass criteria:
 
 - no recurring crashes/restart loops
 - open/close events appear correctly
-- risk guardrails behave as expected
+- risk guardrails fire as expected: timer halts (consecutive-loss / daily-loss), candle cooldown after stop exits, closed-candle signals, high/low exit checks
 - drawdown and consistency are within your plan
 
 ## Troubleshooting

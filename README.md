@@ -15,8 +15,11 @@ This project starts safely at **3x target leverage exposure** in simulation and 
 - Built-in risk engine:
   - per-trade equity risk cap
   - max leverage cap
-  - max daily loss cutoff
-  - max consecutive losses cooldown
+  - rolling drawdown limit (halt for `DAILY_LOSS_HALT_HOURS`)
+  - consecutive-loss limit (halt for `CONSEC_HALT_HOURS`)
+  - per-symbol cooldown after stop exits (`COOLDOWN_CANDLES`)
+- Signals use **closed candles only**; exits check current candle high/low
+- Offline backtester with identical logic (`src/backtest.py`)
 - Paper exchange simulator (fake money first)
 - Live mode intentionally disabled in this MVP (paper-first safety)
 - JSONL trade/event logs for analysis
@@ -68,8 +71,9 @@ The bot will:
 ## Default Risk Profile (Starter)
 
 - Per-trade risk: `0.5%` of equity
-- Daily loss limit: `2%`
-- Max consecutive losses: `3`
+- Rolling drawdown limit: `2%` -> halt for `12h` (`DAILY_LOSS_HALT_HOURS`)
+- Max consecutive losses: `3` -> halt for `6h` (`CONSEC_HALT_HOURS`)
+- Cooldown after stop exit: `24` candles, same-direction only (`COOLDOWN_CANDLES`)
 - Target leverage: `3x`
 
 You can tune these in `.env`.
@@ -96,23 +100,27 @@ Key vars:
 - `TIMEFRAME`: default `5m`
 - `POLL_SECONDS`: default `20`
 - `HEARTBEAT_INTERVAL`: print/log status every N loops (default `1`)
-- `RISK_PER_TRADE_PCT`
-- `MAX_DAILY_LOSS_PCT`
-- `MAX_CONSECUTIVE_LOSSES`
+- `RISK_PER_TRADE_PCT`: equity % risked per trade
+- `MAX_DAILY_LOSS_PCT`: rolling drawdown % that triggers a halt
+- `MAX_CONSECUTIVE_LOSSES`: loss streak that triggers a halt
+- `CONSEC_HALT_HOURS`: hours to pause after consecutive-loss halt (default `6`)
+- `DAILY_LOSS_HALT_HOURS`: hours to pause after drawdown halt (default `12`)
+- `COOLDOWN_CANDLES`: candles to wait after a stop exit before same-direction re-entry
 - `TARGET_LEVERAGE`, `MAX_LEVERAGE`
 
 ## Project Layout
 
-- `src/main.py` - entrypoint
-- `src/bot.py` - main run loop
-- `src/exchange.py` - OKX + paper execution wrapper
-- `src/strategy.py` - signal generation
-- `src/risk.py` - risk sizing and kill-switch logic
-- `src/config.py` - env config
+- `src/main.py` - entrypoint (blocks live mode)
+- `src/bot.py` - main polling loop and per-symbol processing
+- `src/exchange.py` - OKX ccxt adapter + paper broker simulator
+- `src/strategy.py` - EMA crossover / ATR / volume / HTF signal generation
+- `src/risk.py` - position sizing, timer-based halts
+- `src/config.py` - env-based Settings loader
+- `src/models.py` - shared data types (Position, TradeResult, PendingOrder)
+- `src/backtest.py` - offline backtester on cached candle data
+- `src/fetch_candles.py` - download & cache OHLCV from OKX
 
 ## Next Steps
 
-- Add a full backtester with historical data.
 - Add websocket market stream and order-state reconciliation.
 - Add Prometheus/Grafana or Telegram alerts.
-- Add separate configs for paper vs live profiles.
