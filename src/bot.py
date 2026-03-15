@@ -13,7 +13,7 @@ from .config import Settings
 from .exchange import ExchangeAdapter, PaperBroker
 from .models import Side
 from .risk import RiskManager
-from .strategy import generate_signal, htf_trend, volume_ok
+from .strategy import compute_atr, generate_signal, htf_trend, volume_ok
 
 
 @dataclass
@@ -24,7 +24,6 @@ class SymbolState:
     ``COOLDOWN_CANDLES * timeframe_minutes`` wait before re-entering the
     same direction.
     """
-    last_signal: str = "flat"
     last_exit_side: str = ""
     last_exit_ts: Optional[datetime] = None
 
@@ -122,6 +121,25 @@ class FuturesBot:
                     f"last={last_close:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f} (entry_candle)"
                 )
 
+            # Trailing stop: update peak and ratchet stop before exit checks
+            trail_active = False
+            if self.settings.trail_after_r > 0 and pos.initial_stop_distance > 0:
+                if pos.side == "buy":
+                    pos.peak_price = max(pos.peak_price, current_high)
+                    profit = pos.peak_price - pos.entry_price
+                else:
+                    pos.peak_price = min(pos.peak_price, current_low)
+                    profit = pos.entry_price - pos.peak_price
+
+                activation = pos.initial_stop_distance * self.settings.trail_after_r
+                if profit >= activation and pos.trail_atr > 0:
+                    trail_active = True
+                    trail_dist = pos.trail_atr * self.settings.trail_atr_multiplier
+                    if pos.side == "buy":
+                        pos.stop_price = max(pos.stop_price, pos.peak_price - trail_dist)
+                    else:
+                        pos.stop_price = min(pos.stop_price, pos.peak_price + trail_dist)
+
             # Check stop/TP using candle high/low (matches backtest)
             hit_stop = hit_tp = False
             if pos.side == "buy":
@@ -134,7 +152,7 @@ class FuturesBot:
             if hit_stop or hit_tp:
                 if hit_stop:
                     exit_at = pos.stop_price
-                    reason = "stop"
+                    reason = "trail" if trail_active else "stop"
                 else:
                     exit_at = pos.take_profit_price
                     reason = "tp"
@@ -142,7 +160,7 @@ class FuturesBot:
                 trade = self.broker.close_position_at(symbol, exit_at, reason)
                 if trade:
                     self.risk.on_trade_close(trade.pnl, self.broker.equity)
-                    if reason == "stop":
+                    if reason in ("stop", "trail"):
                         state = self.states[symbol]
                         state.last_exit_side = trade.side
                         state.last_exit_ts = datetime.now(timezone.utc)
@@ -166,6 +184,7 @@ class FuturesBot:
             if not volume_ok(closed_candles, self.settings.atr_period, self.settings.volume_min_mult):
                 return f"{symbol} no_entry low_volume signal={signal} last={last_close:.2f}"
 
+        htf_closed: list | None = None
         if self.settings.htf_timeframe:
             htf_ohlcv = self.exchange.fetch_ohlcv(
                 symbol, self.settings.htf_timeframe, self.settings.lookback_candles + 1,
@@ -193,12 +212,16 @@ class FuturesBot:
             if same_dir and elapsed_min < cd_minutes:
                 return f"{symbol} cooldown signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
 
-        stop_price, take_price = self._stops(signal, last_close, atr)
+        stop_atr = atr
+        if self.settings.stop_atr_source == "htf" and htf_closed:
+            stop_atr = compute_atr(htf_closed, self.settings.atr_period)
+        stop_price, take_price = self._stops(signal, last_close, stop_atr)
         size = self.risk.calc_position_size(self.broker.equity, last_close, stop_price)
         if size <= 0:
             return f"{symbol} no_entry size=0 signal={signal} atr_pct={atr_pct:.3f}"
         side = self._entry_side(signal)
 
+        init_stop_dist = abs(last_close - stop_price)
         order = self.broker.place_limit_entry(
             symbol=symbol,
             side=side,
@@ -206,6 +229,8 @@ class FuturesBot:
             limit_price=last_close,
             stop_price=stop_price,
             take_profit_price=take_price,
+            initial_stop_distance=init_stop_dist,
+            trail_atr=stop_atr,
         )
         if order:
             print(

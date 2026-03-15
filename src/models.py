@@ -29,6 +29,9 @@ class Position:
     take_profit_price: float
     opened_at: datetime
     entry_candle_ts: Optional[datetime] = None
+    initial_stop_distance: float = 0.0
+    trail_atr: float = 0.0
+    peak_price: float = 0.0
 
 
 @dataclass
@@ -56,4 +59,5 @@ class PendingOrder:
     stop_price: float
     take_profit_price: float
     placed_at: datetime
-    order_id: str = ""
+    initial_stop_distance: float = 0.0
+    trail_atr: float = 0.0

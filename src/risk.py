@@ -22,14 +22,12 @@ from .config import Settings
 class RiskState:
     """Mutable state tracked by ``RiskManager``.
 
-    ``window_start`` / ``window_start_equity`` reset whenever a halt timer
-    expires, giving the strategy a clean slate after each cooldown period.
+    ``window_start_equity`` resets whenever a halt timer expires, giving
+    the strategy a clean slate after each cooldown period.
     """
-    window_start: datetime
     window_start_equity: float
     consecutive_losses: int = 0
     halted_until: Optional[datetime] = field(default=None)
-    halt_reason: str = ""
 
 
 class RiskManager:
@@ -37,9 +35,7 @@ class RiskManager:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        now = datetime.now(timezone.utc)
         self.state = RiskState(
-            window_start=now,
             window_start_equity=settings.initial_equity,
         )
 
@@ -51,7 +47,6 @@ class RiskManager:
             return
         if self._now() >= self.state.halted_until:
             self.state = RiskState(
-                window_start=self._now(),
                 window_start_equity=equity,
             )
 
@@ -64,18 +59,17 @@ class RiskManager:
 
         dd_pct = ((self.state.window_start_equity - equity) / max(self.state.window_start_equity, 1e-9)) * 100
         if dd_pct >= self.settings.max_daily_loss_pct:
-            self._halt(self.settings.daily_loss_halt_hours, "daily_loss")
+            self._halt(self.settings.daily_loss_halt_hours)
             return False
 
         if self.state.consecutive_losses >= self.settings.max_consecutive_losses:
-            self._halt(self.settings.consec_halt_hours, "consec_losses")
+            self._halt(self.settings.consec_halt_hours)
             return False
 
         return True
 
-    def _halt(self, hours: float, reason: str) -> None:
+    def _halt(self, hours: float) -> None:
         self.state.halted_until = self._now() + timedelta(hours=hours)
-        self.state.halt_reason = reason
 
     def on_trade_close(self, pnl: float, equity: float) -> None:
         """Update streak: increment on loss, reset to 0 on win."""

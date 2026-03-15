@@ -52,7 +52,6 @@ Set these first:
 
 - `MODE=paper`
 - `INITIAL_EQUITY=10000`
-- `TARGET_LEVERAGE=3`
 - `MAX_LEVERAGE=3`
 
 ### 3) Run the bot
@@ -106,7 +105,7 @@ Key vars:
 - `CONSEC_HALT_HOURS`: hours to pause after consecutive-loss halt (default `6`)
 - `DAILY_LOSS_HALT_HOURS`: hours to pause after drawdown halt (default `12`)
 - `COOLDOWN_CANDLES`: candles to wait after a stop exit before same-direction re-entry
-- `TARGET_LEVERAGE`, `MAX_LEVERAGE`
+- `MAX_LEVERAGE`: maximum notional / equity ratio
 
 ## Project Layout
 

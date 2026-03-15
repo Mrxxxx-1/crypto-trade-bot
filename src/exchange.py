@@ -38,18 +38,6 @@ class ExchangeAdapter:
         ticker = self.client.fetch_ticker(symbol)
         return float(ticker["last"])
 
-    def create_market_order(self, symbol: str, side: Side, amount: float) -> dict:
-        return self.client.create_order(symbol=symbol, type="market", side=side, amount=amount)
-
-    def create_limit_order(self, symbol: str, side: Side, amount: float, price: float) -> dict:
-        return self.client.create_order(symbol=symbol, type="limit", side=side, amount=amount, price=price)
-
-    def fetch_order(self, order_id: str, symbol: str) -> dict:
-        return self.client.fetch_order(order_id, symbol)
-
-    def cancel_order(self, order_id: str, symbol: str) -> dict:
-        return self.client.cancel_order(order_id, symbol)
-
 
 class PaperBroker:
     """Simulated execution engine: equity tracking, limit fills, fee/slippage, and JSONL logging."""
@@ -94,6 +82,8 @@ class PaperBroker:
         limit_price: float,
         stop_price: float,
         take_profit_price: float,
+        initial_stop_distance: float = 0.0,
+        trail_atr: float = 0.0,
     ) -> Optional[PendingOrder]:
         """Queue a limit entry.  Returns None if size<=0, already positioned, or pending."""
         if size <= 0 or symbol in self.positions or symbol in self.pending_orders:
@@ -106,6 +96,8 @@ class PaperBroker:
             stop_price=stop_price,
             take_profit_price=take_profit_price,
             placed_at=self._now(),
+            initial_stop_distance=initial_stop_distance,
+            trail_atr=trail_atr,
         )
         self.pending_orders[symbol] = order
         self.log_event("limit_order_placed", {
@@ -144,6 +136,9 @@ class PaperBroker:
             stop_price=order.stop_price,
             take_profit_price=order.take_profit_price,
             opened_at=self._now(),
+            initial_stop_distance=order.initial_stop_distance,
+            trail_atr=order.trail_atr,
+            peak_price=entry,
         )
         self.positions[symbol] = pos
         del self.pending_orders[symbol]

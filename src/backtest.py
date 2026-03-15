@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 from .config import Settings, load_settings
-from .strategy import generate_signal, htf_trend, volume_ok
+from .strategy import compute_atr, generate_signal, htf_trend, volume_ok
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +37,9 @@ class BTPosition:
     take_profit_price: float
     opened_at: datetime
     entry_candle: int
+    initial_stop_distance: float = 0.0
+    trail_atr: float = 0.0
+    peak_price: float = 0.0
 
 
 @dataclass
@@ -183,6 +186,25 @@ def run_backtest(
                 if pos.entry_candle >= i:
                     continue
 
+                # Trailing stop: update peak and ratchet stop
+                trail_active = False
+                if settings.trail_after_r > 0 and pos.initial_stop_distance > 0:
+                    if pos.side == "buy":
+                        pos.peak_price = max(pos.peak_price, high)
+                        profit = pos.peak_price - pos.entry_price
+                    else:
+                        pos.peak_price = min(pos.peak_price, low)
+                        profit = pos.entry_price - pos.peak_price
+
+                    activation = pos.initial_stop_distance * settings.trail_after_r
+                    if profit >= activation and pos.trail_atr > 0:
+                        trail_active = True
+                        trail_dist = pos.trail_atr * settings.trail_atr_multiplier
+                        if pos.side == "buy":
+                            pos.stop_price = max(pos.stop_price, pos.peak_price - trail_dist)
+                        else:
+                            pos.stop_price = min(pos.stop_price, pos.peak_price + trail_dist)
+
                 hit_stop = hit_tp = False
                 if pos.side == "buy":
                     hit_stop = low <= pos.stop_price
@@ -194,7 +216,7 @@ def run_backtest(
                 if hit_stop or hit_tp:
                     if hit_stop:
                         exit_at = pos.stop_price
-                        reason = "stop"
+                        reason = "trail" if trail_active else "stop"
                     else:
                         exit_at = pos.take_profit_price
                         reason = "tp"
@@ -219,7 +241,7 @@ def run_backtest(
                     ))
                     del positions[symbol]
                     risk.on_trade_close(candle_ts, net_pnl, equity)
-                    if reason == "stop":
+                    if reason in ("stop", "trail"):
                         last_exit_candle[symbol] = i
                         last_exit_signal[symbol] = pos.side
                     continue
@@ -258,7 +280,15 @@ def run_backtest(
                 if same_direction and candles_since_exit < cooldown_candles:
                     continue
 
-            stop_dist = atr * settings.stop_atr_multiplier
+            stop_atr = atr
+            if settings.stop_atr_source == "htf" and htf_candles_by_symbol and symbol in htf_candles_by_symbol:
+                candle_time = candles_by_symbol[symbol][i][0]
+                htf_window_for_atr = [c for c in htf_candles_by_symbol[symbol] if c[0] <= candle_time]
+                if len(htf_window_for_atr) >= settings.atr_period + 1:
+                    htf_window_for_atr = htf_window_for_atr[-(settings.atr_period + 1):]
+                    stop_atr = compute_atr(htf_window_for_atr, settings.atr_period)
+
+            stop_dist = stop_atr * settings.stop_atr_multiplier
             if signal == "long":
                 stop = close - stop_dist
                 take = close + stop_dist * settings.take_profit_r
@@ -281,6 +311,9 @@ def run_backtest(
                 entry_price=entry_px, stop_price=stop,
                 take_profit_price=take, opened_at=candle_ts,
                 entry_candle=i,
+                initial_stop_distance=stop_dist,
+                trail_atr=stop_atr,
+                peak_price=entry_px,
             )
 
         equity_curve.append((candle_ts, equity))
@@ -330,6 +363,7 @@ def print_report(result: BTResult, label: str = "BACKTEST") -> None:
     total_fees = sum(t.fees for t in trades)
     n = max(len(trades), 1)
     stop_exits = sum(1 for t in trades if t.exit_reason == "stop")
+    trail_exits = sum(1 for t in trades if t.exit_reason == "trail")
     tp_exits = sum(1 for t in trades if t.exit_reason == "tp")
 
     first_date = result.equity_curve[0][0].strftime("%Y-%m-%d") if result.equity_curve else "?"
@@ -353,9 +387,29 @@ def print_report(result: BTResult, label: str = "BACKTEST") -> None:
     print(f"  Profit factor:       {profit_factor:>10.2f}")
     print(f"{'-' * w}")
     print(f"  Stop exits:          {stop_exits:>6}")
+    print(f"  Trail exits:         {trail_exits:>6}")
     print(f"  TP exits:            {tp_exits:>6}")
     print(f"  Max consec losses:   {max_consec:>6}")
     print(f"  Avg trade P&L:       ${net_pnl / n:>+10,.2f}")
+    print(f"{'-' * w}")
+
+    monthly: dict[str, list[BTTrade]] = {}
+    for t in trades:
+        key = t.closed_at.strftime("%Y-%m")
+        monthly.setdefault(key, []).append(t)
+    if monthly:
+        print(f"  {'Month':<10} {'Trades':>6} {'WinR':>6} {'P&L':>10} {'PF':>6}")
+        for month in sorted(monthly):
+            mt = monthly[month]
+            mw = [t for t in mt if t.pnl > 0]
+            ml = [t for t in mt if t.pnl <= 0]
+            m_pnl = sum(t.pnl for t in mt)
+            m_gw = sum(t.pnl for t in mw)
+            m_gl = abs(sum(t.pnl for t in ml))
+            m_pf = m_gw / m_gl if m_gl > 0 else float("inf")
+            wr = len(mw) / len(mt) * 100
+            print(f"  {month:<10} {len(mt):>6} {wr:>5.0f}% ${m_pnl:>+9,.0f} {m_pf:>5.2f}")
+
     print(f"{'=' * w}\n")
 
 
@@ -364,8 +418,9 @@ def print_report(result: BTResult, label: str = "BACKTEST") -> None:
 # ---------------------------------------------------------------------------
 
 _SETTINGS_FLOATS = {
-    "INITIAL_EQUITY", "TARGET_LEVERAGE", "MAX_LEVERAGE", "RISK_PER_TRADE_PCT",
+    "INITIAL_EQUITY", "MAX_LEVERAGE", "RISK_PER_TRADE_PCT",
     "MAX_DAILY_LOSS_PCT", "ATR_MIN_PCT", "STOP_ATR_MULTIPLIER", "TAKE_PROFIT_R",
+    "TRAIL_AFTER_R", "TRAIL_ATR_MULTIPLIER",
     "ENTRY_FEE_BPS", "EXIT_FEE_BPS", "SLIPPAGE_BPS", "VOLUME_MIN_MULT",
     "CONSEC_HALT_HOURS", "DAILY_LOSS_HALT_HOURS",
 }
@@ -448,6 +503,8 @@ def main() -> None:
         flags.append(f"htf={settings.htf_timeframe}")
     if settings.volume_min_mult > 0:
         flags.append(f"vol>={settings.volume_min_mult}x")
+    if settings.trail_after_r > 0:
+        flags.append(f"trail_after={settings.trail_after_r}R trail_atr_mult={settings.trail_atr_multiplier}")
     flags.append(f"consec_halt={settings.consec_halt_hours}h")
     flags.append(f"daily_halt={settings.daily_loss_halt_hours}h")
     print(f"Flags: {', '.join(flags)}")

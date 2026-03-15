@@ -1,7 +1,7 @@
 """Load bot configuration from environment variables (via ``python-dotenv``).
 
 ``Settings`` is a frozen dataclass consumed by the bot, exchange, risk, and
-strategy modules.  Defaults are suitable for paper trading on 5m candles.
+strategy modules.  Defaults are suitable for paper trading on 15m candles.
 """
 from __future__ import annotations
 
@@ -39,7 +39,6 @@ class Settings:
     lookback_candles: int
 
     initial_equity: float
-    target_leverage: float
     max_leverage: float
     risk_per_trade_pct: float
     max_daily_loss_pct: float
@@ -54,6 +53,9 @@ class Settings:
     cooldown_candles: int  # candles to wait after a stop exit before same-direction re-entry
 
     htf_timeframe: str
+    stop_atr_source: str  # "primary" = use signal-TF ATR; "htf" = use higher-TF ATR for wider stops
+    trail_after_r: float  # activate trailing stop after this many R in profit (0 = disabled)
+    trail_atr_multiplier: float  # trailing distance = this × ATR (from stop_atr_source)
     volume_min_mult: float
 
     consec_halt_hours: float  # hours to halt after max consecutive losses
@@ -86,7 +88,6 @@ def load_settings() -> Settings:
         poll_seconds=_as_int("POLL_SECONDS", 20),
         lookback_candles=_as_int("LOOKBACK_CANDLES", 200),
         initial_equity=_as_float("INITIAL_EQUITY", 10_000),
-        target_leverage=_as_float("TARGET_LEVERAGE", 3),
         max_leverage=_as_float("MAX_LEVERAGE", 3),
         risk_per_trade_pct=_as_float("RISK_PER_TRADE_PCT", 0.5),
         max_daily_loss_pct=_as_float("MAX_DAILY_LOSS_PCT", 2.0),
@@ -99,6 +100,9 @@ def load_settings() -> Settings:
         take_profit_r=_as_float("TAKE_PROFIT_R", 1.5),
         cooldown_candles=_as_int("COOLDOWN_CANDLES", 0),
         htf_timeframe=os.getenv("HTF_TIMEFRAME", "1h"),
+        stop_atr_source=os.getenv("STOP_ATR_SOURCE", "primary"),
+        trail_after_r=_as_float("TRAIL_AFTER_R", 0.0),
+        trail_atr_multiplier=_as_float("TRAIL_ATR_MULTIPLIER", 2.0),
         volume_min_mult=_as_float("VOLUME_MIN_MULT", 0.0),
         consec_halt_hours=_as_float("CONSEC_HALT_HOURS", 6),
         daily_loss_halt_hours=_as_float("DAILY_LOSS_HALT_HOURS", 12),

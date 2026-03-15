@@ -22,6 +22,15 @@ def _ema(values: List[float], period: int) -> float:
     return ema_value
 
 
+def compute_atr(ohlcv: List[List[float]], period: int) -> float:
+    """Return the Average True Range over the last *period* candles.
+
+    Public wrapper so ``bot.py`` and ``backtest.py`` can compute ATR on
+    arbitrary candle series (e.g. HTF candles for wider stop placement).
+    """
+    return _atr(ohlcv, period)
+
+
 def _atr(ohlcv: List[List[float]], period: int) -> float:
     if len(ohlcv) < period + 1:
         return 0.0
