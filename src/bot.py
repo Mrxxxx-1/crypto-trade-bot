@@ -221,12 +221,19 @@ class FuturesBot:
             return f"{symbol} no_entry size=0 signal={signal} atr_pct={atr_pct:.3f}"
         side = self._entry_side(signal)
 
+        current_price = self.exchange.fetch_last_price(symbol)
+        tolerance = current_price * (self.settings.entry_fee_bps / 10_000)
+        if signal == "long":
+            limit_price = current_price + tolerance
+        else:
+            limit_price = current_price - tolerance
+
         init_stop_dist = abs(last_close - stop_price)
         order = self.broker.place_limit_entry(
             symbol=symbol,
             side=side,
             size=size,
-            limit_price=last_close,
+            limit_price=limit_price,
             stop_price=stop_price,
             take_profit_price=take_price,
             initial_stop_distance=init_stop_dist,
@@ -234,11 +241,11 @@ class FuturesBot:
         )
         if order:
             print(
-                f"[{self._utc_now()}] LIMIT {symbol} {side} size={size:.6f} price={last_close:.2f} "
+                f"[{self._utc_now()}] LIMIT {symbol} {side} size={size:.6f} price={limit_price:.2f} "
                 f"stop={stop_price:.2f} tp={take_price:.2f}"
             )
             return (
-                f"{symbol} limit_placed side={side} size={size:.6f} price={last_close:.2f} "
+                f"{symbol} limit_placed side={side} size={size:.6f} price={limit_price:.2f} "
                 f"stop={stop_price:.2f} tp={take_price:.2f}"
             )
         return f"{symbol} no_entry signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
