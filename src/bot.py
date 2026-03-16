@@ -128,7 +128,7 @@ class FuturesBot:
             ):
                 return (
                     f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
-                    f"last={last_close:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f} (entry_candle)"
+                    f"now={float(current_candle[4]):.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f} (entry_candle)"
                 )
 
             # Trailing stop: update peak and ratchet stop before exit checks
@@ -187,7 +187,7 @@ class FuturesBot:
                 pos = self.broker.positions[symbol]
                 return (
                     f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
-                    f"last={last_close:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f}"
+                    f"now={float(current_candle[4]):.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f}"
                 )
 
         # --- 3. Check for new entry ---
@@ -314,4 +314,9 @@ class FuturesBot:
                 break
             except Exception as exc:  # noqa: BLE001
                 print(f"[{self._utc_now()}] ERROR {exc}")
+                self.broker.log_event("error", {
+                    "loop": self.loop_count,
+                    "message": str(exc),
+                    "type": type(exc).__name__,
+                })
                 time.sleep(max(3, self.settings.poll_seconds // 2))

@@ -22,6 +22,9 @@ from .models import PendingOrder, Position, Side, TradeResult
 class ExchangeAdapter:
     """Thin ccxt wrapper for OKX: OHLCV, ticker, and order operations."""
 
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2  # seconds
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.client = ccxt.okx(
@@ -30,14 +33,28 @@ class ExchangeAdapter:
                 "secret": settings.api_secret,
                 "password": settings.api_passphrase,
                 "enableRateLimit": True,
+                "timeout": 15_000,
             }
         )
 
+    def _retry(self, fn, *args, **kwargs):
+        """Call *fn* up to MAX_RETRIES times with a short delay between attempts."""
+        last_exc: Exception | None = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self.MAX_RETRIES - 1:
+                    import time
+                    time.sleep(self.RETRY_DELAY)
+        raise last_exc  # type: ignore[misc]
+
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
-        return self.client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        return self._retry(self.client.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
 
     def fetch_last_price(self, symbol: str) -> float:
-        ticker = self.client.fetch_ticker(symbol)
+        ticker = self._retry(self.client.fetch_ticker, symbol)
         return float(ticker["last"])
 
 
