@@ -4,6 +4,7 @@
 ``PaperBroker`` simulates limit entries, fill checks, fee/slippage, and
 writes trade + event logs to ``logs/``.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,6 +21,7 @@ from .models import PendingOrder, Position, Side, TradeResult
 
 class ExchangeAdapter:
     """Thin ccxt wrapper for OKX: OHLCV, ticker, and order operations."""
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.client = ccxt.okx(
@@ -100,20 +102,34 @@ class PaperBroker:
             trail_atr=trail_atr,
         )
         self.pending_orders[symbol] = order
-        self.log_event("limit_order_placed", {
-            "symbol": symbol, "side": side, "size": size,
-            "limit_price": limit_price, "stop_price": stop_price,
-            "take_profit_price": take_profit_price,
-        })
+        self.log_event(
+            "limit_order_placed",
+            {
+                "symbol": symbol,
+                "side": side,
+                "size": size,
+                "limit_price": limit_price,
+                "stop_price": stop_price,
+                "take_profit_price": take_profit_price,
+            },
+        )
         return order
 
-    def check_pending_fill(self, symbol: str) -> Optional[Position]:
+    def check_pending_fill(
+        self,
+        symbol: str,
+        known_price: Optional[float] = None,
+    ) -> Optional[Position]:
         """Check if a pending limit order would fill at current price."""
         order = self.pending_orders.get(symbol)
         if not order:
             return None
 
-        last = self.exchange.fetch_last_price(symbol)
+        last = (
+            known_price
+            if known_price is not None
+            else self.exchange.fetch_last_price(symbol)
+        )
         filled = False
         if order.side == "buy" and last <= order.limit_price:
             filled = True
@@ -143,12 +159,20 @@ class PaperBroker:
         self.positions[symbol] = pos
         del self.pending_orders[symbol]
 
-        self.log_event("position_open", {
-            "symbol": symbol, "side": order.side, "size": order.size,
-            "entry_price": entry, "stop_price": order.stop_price,
-            "take_profit_price": order.take_profit_price,
-            "fee": fee, "equity": self.equity, "order_type": "limit",
-        })
+        self.log_event(
+            "position_open",
+            {
+                "symbol": symbol,
+                "side": order.side,
+                "size": order.size,
+                "entry_price": entry,
+                "stop_price": order.stop_price,
+                "take_profit_price": order.take_profit_price,
+                "fee": fee,
+                "equity": self.equity,
+                "order_type": "limit",
+            },
+        )
         return pos
 
     def cancel_pending(self, symbol: str) -> bool:
@@ -171,7 +195,10 @@ class PaperBroker:
     # ------------------------------------------------------------------
 
     def close_position_at(
-        self, symbol: str, exit_at: float, exit_reason: str,
+        self,
+        symbol: str,
+        exit_at: float,
+        exit_reason: str,
     ) -> Optional[TradeResult]:
         """Close position at an exact stop/TP level with slippage applied."""
         pos = self.positions.get(symbol)
@@ -212,10 +239,18 @@ class PaperBroker:
         payload["closed_at"] = trade.closed_at.isoformat()
         payload["equity"] = self.equity
         self._write_jsonl("trades.jsonl", payload)
-        self.log_event("position_close", {
-            "symbol": trade.symbol, "side": trade.side, "size": trade.size,
-            "entry_price": trade.entry_price, "exit_price": trade.exit_price,
-            "pnl": trade.pnl, "fees": trade.fees, "equity": self.equity,
-            "exit_reason": exit_reason,
-        })
+        self.log_event(
+            "position_close",
+            {
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "size": trade.size,
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "pnl": trade.pnl,
+                "fees": trade.fees,
+                "equity": self.equity,
+                "exit_reason": exit_reason,
+            },
+        )
         return trade

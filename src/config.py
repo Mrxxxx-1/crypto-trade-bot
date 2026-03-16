@@ -3,6 +3,7 @@
 ``Settings`` is a frozen dataclass consumed by the bot, exchange, risk, and
 strategy modules.  Defaults are suitable for paper trading on 15m candles.
 """
+
 from __future__ import annotations
 
 import os
@@ -50,11 +51,17 @@ class Settings:
     atr_min_pct: float
     stop_atr_multiplier: float
     take_profit_r: float
-    cooldown_candles: int  # candles to wait after a stop exit before same-direction re-entry
+    cooldown_candles: (
+        int  # candles to wait after a stop exit before same-direction re-entry
+    )
 
     htf_timeframe: str
-    stop_atr_source: str  # "primary" = use signal-TF ATR; "htf" = use higher-TF ATR for wider stops
-    trail_after_r: float  # activate trailing stop after this many R in profit (0 = disabled)
+    stop_atr_source: (
+        str  # "primary" = use signal-TF ATR; "htf" = use higher-TF ATR for wider stops
+    )
+    trail_after_r: (
+        float  # activate trailing stop after this many R in profit (0 = disabled)
+    )
     trail_atr_multiplier: float  # trailing distance = this × ATR (from stop_atr_source)
     volume_min_mult: float
 
@@ -76,7 +83,11 @@ def load_settings() -> Settings:
     """Load ``.env``, parse every variable with its documented default, return Settings."""
     load_dotenv()
 
-    symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC-USDT-SWAP,ETH-USDT-SWAP").split(",") if s.strip()]
+    symbols = [
+        s.strip()
+        for s in os.getenv("SYMBOLS", "BTC-USDT-SWAP,ETH-USDT-SWAP").split(",")
+        if s.strip()
+    ]
 
     return Settings(
         mode=os.getenv("MODE", "paper"),

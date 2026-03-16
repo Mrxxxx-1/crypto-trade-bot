@@ -2,6 +2,7 @@
 check exits via current candle high/low, manage limit entries, cooldown,
 and risk halts.
 """
+
 from __future__ import annotations
 
 import time
@@ -24,6 +25,7 @@ class SymbolState:
     ``COOLDOWN_CANDLES * timeframe_minutes`` wait before re-entering the
     same direction.
     """
+
     last_exit_side: str = ""
     last_exit_ts: Optional[datetime] = None
 
@@ -36,7 +38,9 @@ class FuturesBot:
         self.exchange = ExchangeAdapter(settings)
         self.risk = RiskManager(settings)
         self.broker = PaperBroker(settings, self.exchange)
-        self.states: Dict[str, SymbolState] = {symbol: SymbolState() for symbol in settings.symbols}
+        self.states: Dict[str, SymbolState] = {
+            symbol: SymbolState() for symbol in settings.symbols
+        }
         self.loop_count = 0
 
     def _utc_now(self) -> str:
@@ -76,7 +80,9 @@ class FuturesBot:
         4. Enter new positions after cooldown, risk, and filter checks.
         """
         ohlcv = self.exchange.fetch_ohlcv(
-            symbol, self.settings.timeframe, self.settings.lookback_candles + 1,
+            symbol,
+            self.settings.timeframe,
+            self.settings.lookback_candles + 1,
         )
         if len(ohlcv) < 2:
             return f"{symbol} insufficient_data"
@@ -85,7 +91,8 @@ class FuturesBot:
         closed_candles = ohlcv[:-1]
         current_candle = ohlcv[-1]
         current_candle_ts = datetime.fromtimestamp(
-            current_candle[0] / 1000, tz=timezone.utc,
+            current_candle[0] / 1000,
+            tz=timezone.utc,
         )
         current_high = float(current_candle[2])
         current_low = float(current_candle[3])
@@ -115,7 +122,10 @@ class FuturesBot:
             pos = self.broker.positions[symbol]
 
             # Skip exit on entry candle (matches backtest)
-            if pos.entry_candle_ts is not None and current_candle_ts <= pos.entry_candle_ts:
+            if (
+                pos.entry_candle_ts is not None
+                and current_candle_ts <= pos.entry_candle_ts
+            ):
                 return (
                     f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
                     f"last={last_close:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f} (entry_candle)"
@@ -136,9 +146,13 @@ class FuturesBot:
                     trail_active = True
                     trail_dist = pos.trail_atr * self.settings.trail_atr_multiplier
                     if pos.side == "buy":
-                        pos.stop_price = max(pos.stop_price, pos.peak_price - trail_dist)
+                        pos.stop_price = max(
+                            pos.stop_price, pos.peak_price - trail_dist
+                        )
                     else:
-                        pos.stop_price = min(pos.stop_price, pos.peak_price + trail_dist)
+                        pos.stop_price = min(
+                            pos.stop_price, pos.peak_price + trail_dist
+                        )
 
             # Check stop/TP using candle high/low (matches backtest)
             hit_stop = hit_tp = False
@@ -181,13 +195,17 @@ class FuturesBot:
             return f"{symbol} no_entry signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
 
         if self.settings.volume_min_mult > 0:
-            if not volume_ok(closed_candles, self.settings.atr_period, self.settings.volume_min_mult):
+            if not volume_ok(
+                closed_candles, self.settings.atr_period, self.settings.volume_min_mult
+            ):
                 return f"{symbol} no_entry low_volume signal={signal} last={last_close:.2f}"
 
         htf_closed: list | None = None
         if self.settings.htf_timeframe:
             htf_ohlcv = self.exchange.fetch_ohlcv(
-                symbol, self.settings.htf_timeframe, self.settings.lookback_candles + 1,
+                symbol,
+                self.settings.htf_timeframe,
+                self.settings.lookback_candles + 1,
             )
             if len(htf_ohlcv) > 1:
                 htf_closed = htf_ohlcv[:-1]
@@ -204,11 +222,12 @@ class FuturesBot:
         state = self.states[symbol]
         cd_minutes = self.settings.cooldown_candles * self._timeframe_minutes()
         if cd_minutes > 0 and state.last_exit_ts is not None:
-            same_dir = (
-                (signal == "long" and state.last_exit_side == "buy")
-                or (signal == "short" and state.last_exit_side == "sell")
+            same_dir = (signal == "long" and state.last_exit_side == "buy") or (
+                signal == "short" and state.last_exit_side == "sell"
             )
-            elapsed_min = (datetime.now(timezone.utc) - state.last_exit_ts).total_seconds() / 60
+            elapsed_min = (
+                datetime.now(timezone.utc) - state.last_exit_ts
+            ).total_seconds() / 60
             if same_dir and elapsed_min < cd_minutes:
                 return f"{symbol} cooldown signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
 
@@ -222,7 +241,8 @@ class FuturesBot:
         side = self._entry_side(signal)
 
         current_price = self.exchange.fetch_last_price(symbol)
-        tolerance = current_price * (self.settings.entry_fee_bps / 10_000)
+        fee_edge_bps = max(0.0, self.settings.exit_fee_bps - self.settings.entry_fee_bps)
+        tolerance = current_price * (fee_edge_bps / 10_000)
         if signal == "long":
             limit_price = current_price + tolerance
         else:
@@ -240,6 +260,17 @@ class FuturesBot:
             trail_atr=stop_atr,
         )
         if order:
+            pos = self.broker.check_pending_fill(symbol, known_price=current_price)
+            if pos:
+                pos.entry_candle_ts = current_candle_ts
+                print(
+                    f"[{self._utc_now()}] FILLED {symbol} {pos.side} size={pos.size:.6f} "
+                    f"entry={pos.entry_price:.2f} equity={self.broker.equity:.2f}"
+                )
+                return (
+                    f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
+                    f"last={last_close:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f}"
+                )
             print(
                 f"[{self._utc_now()}] LIMIT {symbol} {side} size={size:.6f} price={limit_price:.2f} "
                 f"stop={stop_price:.2f} tp={take_price:.2f}"
@@ -252,7 +283,9 @@ class FuturesBot:
 
     def run_forever(self) -> None:
         """Main loop: process all symbols, sleep, log heartbeats."""
-        print(f"[{self._utc_now()}] Start bot mode={self.settings.mode} symbols={self.settings.symbols}")
+        print(
+            f"[{self._utc_now()}] Start bot mode={self.settings.mode} symbols={self.settings.symbols}"
+        )
         while True:
             try:
                 self.loop_count += 1
