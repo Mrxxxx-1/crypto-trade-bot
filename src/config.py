@@ -74,9 +74,24 @@ class Settings:
     limit_timeout_seconds: int
     heartbeat_interval: int
 
+    # Optional: daily Telegram briefing via Gemini (see ``src.briefing``)
+    daily_briefing_enabled: bool
+    telegram_bot_token: str
+    telegram_chat_id: str
+    gemini_api_key: str
+    daily_briefing_hour_utc: int  # 0–23, minute 0
+
     @property
     def is_live(self) -> bool:
         return self.mode.lower().strip() == "live"
+
+    @property
+    def daily_briefing_configured(self) -> bool:
+        return bool(
+            self.telegram_bot_token.strip()
+            and self.telegram_chat_id.strip()
+            and self.gemini_api_key.strip()
+        )
 
 
 def load_settings() -> Settings:
@@ -122,4 +137,12 @@ def load_settings() -> Settings:
         slippage_bps=_as_float("SLIPPAGE_BPS", 2),
         limit_timeout_seconds=_as_int("LIMIT_TIMEOUT_SECONDS", 30),
         heartbeat_interval=max(1, _as_int("HEARTBEAT_INTERVAL", 1)),
+        daily_briefing_enabled=os.getenv("DAILY_BRIEFING_ENABLED", "").lower()
+        in ("1", "true", "yes"),
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+        daily_briefing_hour_utc=max(
+            0, min(23, _as_int("DAILY_BRIEFING_HOUR_UTC", 8))
+        ),
     )
