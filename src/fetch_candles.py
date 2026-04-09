@@ -1,8 +1,8 @@
-"""Download and cache historical OHLCV candle data from OKX.
+"""Download and cache historical OHLCV candle data from Hyperliquid.
 
 Usage:
     python -m src.fetch_candles
-    python -m src.fetch_candles --symbols BTC-USDT-SWAP --days 60 --timeframe 5m
+    python -m src.fetch_candles --symbols BTC/USDC:USDC --days 60 --timeframe 5m
 """
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ import ccxt
 
 
 def fetch_symbol(
-    exchange: ccxt.okx,
+    exchange: ccxt.hyperliquid,
     symbol: str,
     timeframe: str,
     since_ms: int,
     limit_per_req: int = 100,
 ) -> list[list]:
-    """Paginate OHLCV from OKX, deduplicate, and return sorted candles."""
+    """Paginate OHLCV from Hyperliquid, deduplicate, and return sorted candles."""
     all_candles: list[list] = []
     cursor = since_ms
 
@@ -49,7 +49,7 @@ def fetch_symbol(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch & cache OHLCV data")
-    parser.add_argument("--symbols", nargs="+", default=["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
+    parser.add_argument("--symbols", nargs="+", default=["BTC/USDC:USDC", "ETH/USDC:USDC"])
     parser.add_argument("--timeframes", nargs="+", default=["5m", "1h"])
     parser.add_argument("--days", type=int, default=45)
     parser.add_argument("--out", default="data")
@@ -58,7 +58,7 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    exchange = ccxt.okx({"enableRateLimit": True})
+    exchange = ccxt.hyperliquid({"enableRateLimit": True})
     since_ms = int((datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp() * 1000)
 
     for symbol in args.symbols:

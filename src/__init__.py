@@ -1,1 +1,1 @@
-"""OKX futures bot package."""
+"""Hyperliquid futures bot package."""

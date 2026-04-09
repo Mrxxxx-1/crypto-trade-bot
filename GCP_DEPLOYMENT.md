@@ -1,6 +1,6 @@
 # GCP Deployment Guide (Paper Mode)
 
-This guide deploys the bot to Google Cloud Platform for 24/7 paper trading.
+This guide deploys the Hyperliquid paper-trading bot to Google Cloud Platform for 24/7 operation.
 
 ## 1) Create VM on GCP
 

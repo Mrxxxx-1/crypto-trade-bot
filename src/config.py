@@ -1,7 +1,8 @@
 """Load bot configuration from environment variables (via ``python-dotenv``).
 
 ``Settings`` is a frozen dataclass consumed by the bot, exchange, risk, and
-strategy modules.  Defaults are suitable for paper trading on 15m candles.
+strategy modules.  Defaults are suitable for paper trading on Hyperliquid
+perpetual futures (USDC-margined).
 """
 
 from __future__ import annotations
@@ -30,9 +31,9 @@ def _as_int(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Settings:
     mode: str
-    api_key: str
-    api_secret: str
-    api_passphrase: str
+    wallet_address: str
+    private_key: str
+    testnet: bool
 
     symbols: List[str]
     timeframe: str
@@ -100,15 +101,15 @@ def load_settings() -> Settings:
 
     symbols = [
         s.strip()
-        for s in os.getenv("SYMBOLS", "BTC-USDT-SWAP,ETH-USDT-SWAP").split(",")
+        for s in os.getenv("SYMBOLS", "BTC/USDC:USDC,ETH/USDC:USDC").split(",")
         if s.strip()
     ]
 
     return Settings(
         mode=os.getenv("MODE", "paper"),
-        api_key=os.getenv("OKX_API_KEY", ""),
-        api_secret=os.getenv("OKX_API_SECRET", ""),
-        api_passphrase=os.getenv("OKX_API_PASSPHRASE", ""),
+        wallet_address=os.getenv("HL_WALLET_ADDRESS", "").strip(),
+        private_key=os.getenv("HL_PRIVATE_KEY", "").strip(),
+        testnet=os.getenv("HL_TESTNET", "").lower() in ("1", "true", "yes"),
         symbols=symbols,
         timeframe=os.getenv("TIMEFRAME", "5m"),
         poll_seconds=_as_int("POLL_SECONDS", 20),

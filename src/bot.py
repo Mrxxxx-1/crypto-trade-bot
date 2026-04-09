@@ -31,7 +31,7 @@ class SymbolState:
 
 
 class FuturesBot:
-    """Paper futures bot: polls OKX, runs strategy, and manages risk per tick."""
+    """Paper futures bot: polls Hyperliquid, runs strategy, and manages risk per tick."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings

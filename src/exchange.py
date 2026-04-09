@@ -1,4 +1,4 @@
-"""OKX exchange adapter (via ccxt) and paper broker for simulated execution.
+"""Hyperliquid exchange adapter (via ccxt) and paper broker for simulated execution.
 
 ``ExchangeAdapter`` wraps ccxt for OHLCV, ticker, and order calls.
 ``PaperBroker`` simulates limit entries, fill checks, fee/slippage, and
@@ -20,22 +20,24 @@ from .models import PendingOrder, Position, Side, TradeResult
 
 
 class ExchangeAdapter:
-    """Thin ccxt wrapper for OKX: OHLCV, ticker, and order operations."""
+    """Thin ccxt wrapper for Hyperliquid: OHLCV, ticker, and order operations."""
 
     MAX_RETRIES = 3
     RETRY_DELAY = 2  # seconds
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.client = ccxt.okx(
-            {
-                "apiKey": settings.api_key,
-                "secret": settings.api_secret,
-                "password": settings.api_passphrase,
-                "enableRateLimit": True,
-                "timeout": 15_000,
-            }
-        )
+        config: dict = {
+            "enableRateLimit": True,
+            "timeout": 15_000,
+        }
+        if settings.wallet_address:
+            config["apiKey"] = settings.wallet_address
+        if settings.private_key:
+            config["secret"] = settings.private_key
+        if settings.testnet:
+            config["sandbox"] = True
+        self.client = ccxt.hyperliquid(config)
 
     def _retry(self, fn, *args, **kwargs):
         """Call *fn* up to MAX_RETRIES times with a short delay between attempts."""

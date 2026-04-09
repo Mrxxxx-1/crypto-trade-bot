@@ -258,7 +258,7 @@ def build_prompt(stats: WindowStats) -> str:
     raw = json.dumps(payload, indent=2, default=str)
     return (
         "You are a disciplined trading operations assistant. Using ONLY the JSON data below "
-        "(paper futures bot on OKX), write a concise daily briefing in plain text (no markdown tables).\n\n"
+        "(paper futures bot on Hyperliquid), write a concise daily briefing in plain text (no markdown tables).\n\n"
         "Include these sections with short headers:\n"
         "1) Performance — P&L, win/loss count, fees, symbol breakdown if any trades.\n"
         "2) Risk — drawdown context from equity if present, blocked_by_risk frequency, errors.\n"
@@ -270,8 +270,26 @@ def build_prompt(stats: WindowStats) -> str:
     )
 
 
-def run_daily_briefing(settings: Settings, logs_dir: Path | None = None) -> None:
-    """Collect logs, call Gemini, send Telegram. Raises on missing config or API failure."""
+def _log_briefing(logs_dir: Path, stats: WindowStats, body: str) -> None:
+    """Append a full briefing record to ``logs/briefings.jsonl``."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "window_since": stats.since.isoformat(),
+        "window_until": stats.until.isoformat(),
+        "trade_summary": stats.trade_summary,
+        "event_summary": stats.event_summary,
+        "briefing_text": body,
+    }
+    path = logs_dir / "briefings.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+def run_daily_briefing(settings: Settings, logs_dir: Path | None = None) -> str:
+    """Collect logs, call Gemini, send Telegram, write to briefings.jsonl.
+
+    Returns the full briefing message that was sent.
+    """
     if not settings.daily_briefing_configured:
         raise RuntimeError(
             "Briefing requires TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and GEMINI_API_KEY."
@@ -286,11 +304,14 @@ def run_daily_briefing(settings: Settings, logs_dir: Path | None = None) -> None
         f"---\n"
     )
     body = _gemini_generate(settings.gemini_api_key, prompt)
+    message = title + body
     _telegram_send(
         settings.telegram_bot_token,
         settings.telegram_chat_id,
-        title + body,
+        message,
     )
+    _log_briefing(root, stats, message)
+    return message
 
 
 _STATE_NAME = "briefing_state.json"
@@ -307,11 +328,17 @@ def _load_last_sent(logs_dir: Path) -> str | None:
         return None
 
 
-def _save_last_sent(logs_dir: Path, utc_date: str) -> None:
+def _save_last_sent(logs_dir: Path, utc_date: str, briefing_text: str = "") -> None:
     path = logs_dir / _STATE_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"last_sent_utc_date": utc_date}, indent=2),
+        json.dumps(
+            {
+                "last_sent_utc_date": utc_date,
+                "last_briefing": briefing_text,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -328,8 +355,8 @@ def briefing_scheduler_loop(settings: Settings) -> None:
                 now.hour == settings.daily_briefing_hour_utc
                 and last != today
             ):
-                run_daily_briefing(settings, logs_dir)
-                _save_last_sent(logs_dir, today)
+                message = run_daily_briefing(settings, logs_dir)
+                _save_last_sent(logs_dir, today, message)
         except Exception as exc:  # noqa: BLE001 — keep thread alive
             print(f"[briefing] ERROR {exc}")
         time.sleep(30)
@@ -355,7 +382,10 @@ def main() -> None:
         raise SystemExit(
             "Set TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and GEMINI_API_KEY in .env"
         )
-    run_daily_briefing(settings)
+    logs_dir = Path("logs")
+    message = run_daily_briefing(settings, logs_dir)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _save_last_sent(logs_dir, today, message)
     print("Briefing sent.")
 
 

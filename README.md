@@ -1,6 +1,6 @@
-# OKX BTC/ETH Futures Bot (Paper-First)
+# Hyperliquid BTC/ETH Futures Bot (Paper-First)
 
-Automated crypto futures bot for **BTC-USDT-SWAP** and **ETH-USDT-SWAP** on OKX.
+Automated crypto futures bot for **BTC/USDC:USDC** and **ETH/USDC:USDC** perpetual swaps on Hyperliquid.
 Runs in paper mode by default -- live trading is intentionally disabled.
 
 ## Strategy
@@ -47,6 +47,7 @@ copy .env.example .env
 ```
 
 Edit `.env` -- at minimum set `MODE=paper` and review the strategy / risk parameters.
+For Hyperliquid, credentials (`HL_WALLET_ADDRESS`, `HL_PRIVATE_KEY`) are only required for live trading; public market data works without them.
 
 ### 3. Fetch historical data (for backtesting)
 
@@ -70,7 +71,7 @@ python -m src.backtest --cooldown 12 --label TIGHT_CD
 python -m src.main
 ```
 
-The bot polls OKX every `POLL_SECONDS`, generates signals, simulates orders in paper mode, and writes logs to `logs/events.jsonl` and `logs/trades.jsonl`.
+The bot polls Hyperliquid every `POLL_SECONDS`, generates signals, simulates orders in paper mode, and writes logs to `logs/events.jsonl` and `logs/trades.jsonl`.
 
 ### 6. Daily Telegram briefing (optional)
 
@@ -99,15 +100,15 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODE` | `paper` | `paper` or `live` (live is blocked in this version) |
-| `OKX_API_KEY` | | OKX API key |
-| `OKX_API_SECRET` | | OKX API secret |
-| `OKX_API_PASSPHRASE` | | OKX API passphrase |
+| `HL_WALLET_ADDRESS` | | Your 0x… EVM wallet address |
+| `HL_PRIVATE_KEY` | | Hex private key for the wallet |
+| `HL_TESTNET` | `false` | Use Hyperliquid testnet (`true` / `false`) |
 
 ### Market
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYMBOLS` | `BTC-USDT-SWAP,ETH-USDT-SWAP` | Comma-separated perpetual swap symbols |
+| `SYMBOLS` | `BTC/USDC:USDC,ETH/USDC:USDC` | Comma-separated perpetual swap symbols (ccxt format) |
 | `TIMEFRAME` | `5m` | Primary candle timeframe |
 | `POLL_SECONDS` | `20` | Seconds between each polling loop |
 | `LOOKBACK_CANDLES` | `200` | Number of candles fetched for indicator calculation |
@@ -157,7 +158,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENTRY_FEE_BPS` | `2` | Entry fee in basis points (limit/maker) |
-| `EXIT_FEE_BPS` | `5` | Exit fee in basis points (market/taker) |
+| `EXIT_FEE_BPS` | `3.5` | Exit fee in basis points (market/taker) |
 | `SLIPPAGE_BPS` | `2` | Simulated slippage on exits |
 | `LIMIT_TIMEOUT_SECONDS` | `30` | Cancel unfilled limit orders after this many seconds |
 
@@ -169,8 +170,8 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `TELEGRAM_BOT_TOKEN` | | Bot token from [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_ID` | | Destination chat id (user or group; message the bot `/start` first for private chats) |
 | `GEMINI_API_KEY` | | Google AI / Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Model id if you need another Gemini model |
-| `DAILY_BRIEFING_HOUR_UTC` | `6` | UTC hour (0–23) for the in-process daily send |
+| `GEMINI_MODEL` | `gemini-2.0-flash` | Model id if you need another Gemini model |
+| `DAILY_BRIEFING_HOUR_UTC` | `8` | UTC hour (0–23) for the in-process daily send |
 
 ## Project Layout
 
@@ -178,17 +179,18 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 src/
   main.py           Entry point -- blocks live mode, runs paper bot
   bot.py            Main polling loop and per-symbol processing
-  exchange.py       OKX ccxt adapter (with retry) + paper broker
+  exchange.py       Hyperliquid ccxt adapter (with retry) + paper broker
   strategy.py       EMA crossover / ATR / volume / HTF signals
   risk.py           Position sizing and timer-based halt logic
   config.py         Loads Settings from .env
   models.py         Shared types: Position, TradeResult, PendingOrder
   backtest.py       Offline backtester on cached candle data
-  fetch_candles.py  Download & cache OHLCV from OKX
+  fetch_candles.py  Download & cache OHLCV from Hyperliquid
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
 logs/
   events.jsonl      Heartbeats, position opens/closes, errors
   trades.jsonl      Completed trade records with P&L
+  briefings.jsonl   Full daily briefing history
   briefing_state.json  Last UTC date the in-process daily briefing was sent (optional)
 data/
   *.json            Cached OHLCV candle data for backtesting
