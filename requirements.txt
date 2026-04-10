@@ -1,3 +1,3 @@
-ccxt
+hyperliquid-python-sdk>=0.20.0
 python-dotenv
 google-generativeai>=0.8.0

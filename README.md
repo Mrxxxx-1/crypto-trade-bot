@@ -108,7 +108,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYMBOLS` | `BTC/USDC:USDC,ETH/USDC:USDC` | Comma-separated perpetual swap symbols (ccxt format) |
+| `SYMBOLS` | `BTC/USDC:USDC,ETH/USDC:USDC` | Comma-separated perpetual symbols (base coin before `/`, e.g. `BTC`) |
 | `TIMEFRAME` | `5m` | Primary candle timeframe |
 | `POLL_SECONDS` | `20` | Seconds between each polling loop |
 | `LOOKBACK_CANDLES` | `200` | Number of candles fetched for indicator calculation |
@@ -179,7 +179,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 src/
   main.py           Entry point -- blocks live mode, runs paper bot
   bot.py            Main polling loop and per-symbol processing
-  exchange.py       Hyperliquid ccxt adapter (with retry) + paper broker
+  exchange.py       Hyperliquid official SDK adapter (with retry) + paper / live broker
   strategy.py       EMA crossover / ATR / volume / HTF signals
   risk.py           Position sizing and timer-based halt logic
   config.py         Loads Settings from .env

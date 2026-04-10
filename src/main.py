@@ -1,6 +1,7 @@
-"""Entry point: load settings and run the paper futures bot.
+"""Entry point: load settings and run the Hyperliquid futures bot.
 
-Live mode is intentionally disabled in this MVP -- set MODE=paper.
+Supports both ``MODE=paper`` (simulated fills) and ``MODE=live``
+(real orders on Hyperliquid via the official Python SDK).
 """
 from __future__ import annotations
 
@@ -11,11 +12,23 @@ from .config import load_settings
 
 def main() -> None:
     settings = load_settings()
+
     if settings.is_live:
-        raise RuntimeError(
-            "Live mode is intentionally disabled in this MVP. "
-            "Set MODE=paper for fake-money testing first."
+        if not settings.wallet_address or not settings.private_key:
+            raise RuntimeError(
+                "Live mode requires HL_WALLET_ADDRESS and HL_PRIVATE_KEY in .env"
+            )
+        print(
+            "*** LIVE MODE — real orders will be placed on Hyperliquid ***\n"
+            f"    Wallet : {settings.wallet_address[:8]}…{settings.wallet_address[-4:]}\n"
+            f"    Symbols: {settings.symbols}\n"
+            f"    Leverage cap: {settings.max_leverage}x\n"
+            f"    Risk/trade: {settings.risk_per_trade_pct}%\n"
+            f"    Testnet: {settings.testnet}\n"
         )
+    else:
+        print(f"Paper mode — no real orders. Symbols: {settings.symbols}")
+
     if settings.daily_briefing_enabled:
         if settings.daily_briefing_configured:
             start_briefing_thread(settings)
@@ -28,6 +41,7 @@ def main() -> None:
                 "DAILY_BRIEFING_ENABLED is set but TELEGRAM_BOT_TOKEN / "
                 "TELEGRAM_CHAT_ID / GEMINI_API_KEY are missing — skipping briefing."
             )
+
     bot = FuturesBot(settings)
     bot.run_forever()
 

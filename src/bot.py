@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from .config import Settings
-from .exchange import ExchangeAdapter, PaperBroker
+from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
 from .models import Side
 from .risk import RiskManager
 from .strategy import compute_atr, generate_signal, htf_trend, volume_ok
@@ -37,7 +37,10 @@ class FuturesBot:
         self.settings = settings
         self.exchange = ExchangeAdapter(settings)
         self.risk = RiskManager(settings)
-        self.broker = PaperBroker(settings, self.exchange)
+        if settings.is_live:
+            self.broker: PaperBroker | LiveBroker = LiveBroker(settings, self.exchange)
+        else:
+            self.broker = PaperBroker(settings, self.exchange)
         self.states: Dict[str, SymbolState] = {
             symbol: SymbolState() for symbol in settings.symbols
         }

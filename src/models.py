@@ -61,3 +61,4 @@ class PendingOrder:
     placed_at: datetime
     initial_stop_distance: float = 0.0
     trail_atr: float = 0.0
+    exchange_order_id: Optional[str] = None
