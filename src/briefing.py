@@ -294,7 +294,7 @@ def run_daily_briefing(settings: Settings, logs_dir: Path | None = None) -> str:
         raise RuntimeError(
             "Briefing requires TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and GEMINI_API_KEY."
         )
-    root = logs_dir or Path("logs")
+    root = logs_dir or Path(settings.logs_dir)
     stats = collect_window(root, hours=24)
     prompt = build_prompt(stats)
     title = (
@@ -345,7 +345,7 @@ def _save_last_sent(logs_dir: Path, utc_date: str, briefing_text: str = "") -> N
 
 def briefing_scheduler_loop(settings: Settings) -> None:
     """Background loop: once per UTC calendar day at ``DAILY_BRIEFING_HOUR_UTC``."""
-    logs_dir = Path("logs")
+    logs_dir = Path(settings.logs_dir)
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -382,7 +382,7 @@ def main() -> None:
         raise SystemExit(
             "Set TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and GEMINI_API_KEY in .env"
         )
-    logs_dir = Path("logs")
+    logs_dir = Path(settings.logs_dir)
     message = run_daily_briefing(settings, logs_dir)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _save_last_sent(logs_dir, today, message)

@@ -55,6 +55,9 @@ class Settings:
     cooldown_candles: (
         int  # candles to wait after a stop exit before same-direction re-entry
     )
+    post_stop_candles: (
+        int  # candles to wait after a stop exit before any-direction re-entry
+    )
 
     htf_timeframe: str
     stop_atr_source: (
@@ -126,6 +129,7 @@ def load_settings() -> Settings:
         stop_atr_multiplier=_as_float("STOP_ATR_MULTIPLIER", 1.8),
         take_profit_r=_as_float("TAKE_PROFIT_R", 1.5),
         cooldown_candles=_as_int("COOLDOWN_CANDLES", 0),
+        post_stop_candles=_as_int("POST_STOP_CANDLES", 0),
         htf_timeframe=os.getenv("HTF_TIMEFRAME", "1h"),
         stop_atr_source=os.getenv("STOP_ATR_SOURCE", "primary"),
         trail_after_r=_as_float("TRAIL_AFTER_R", 0.0),

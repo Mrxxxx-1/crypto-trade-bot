@@ -223,14 +223,28 @@ class FuturesBot:
             return f"{symbol} blocked_by_risk signal={signal} atr_pct={atr_pct:.3f}"
 
         state = self.states[symbol]
-        cd_minutes = self.settings.cooldown_candles * self._timeframe_minutes()
-        if cd_minutes > 0 and state.last_exit_ts is not None:
-            same_dir = (signal == "long" and state.last_exit_side == "buy") or (
-                signal == "short" and state.last_exit_side == "sell"
-            )
+        elapsed_min = None
+        if state.last_exit_ts is not None:
             elapsed_min = (
                 datetime.now(timezone.utc) - state.last_exit_ts
             ).total_seconds() / 60
+
+        post_stop_minutes = self.settings.post_stop_candles * self._timeframe_minutes()
+        if (
+            post_stop_minutes > 0
+            and elapsed_min is not None
+            and elapsed_min < post_stop_minutes
+        ):
+            return (
+                f"{symbol} cooldown_post_stop signal={signal} "
+                f"atr_pct={atr_pct:.3f} last={last_close:.2f}"
+            )
+
+        cd_minutes = self.settings.cooldown_candles * self._timeframe_minutes()
+        if cd_minutes > 0 and elapsed_min is not None:
+            same_dir = (signal == "long" and state.last_exit_side == "buy") or (
+                signal == "short" and state.last_exit_side == "sell"
+            )
             if same_dir and elapsed_min < cd_minutes:
                 return f"{symbol} cooldown signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
 

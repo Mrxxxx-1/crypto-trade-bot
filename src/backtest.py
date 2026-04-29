@@ -141,6 +141,7 @@ def run_backtest(
     candles_by_symbol: Dict[str, List[list]],
     *,
     cooldown_candles: int = 0,
+    post_stop_candles: int = 0,
     htf_candles_by_symbol: Optional[Dict[str, List[list]]] = None,
 ) -> BTResult:
     """Replay candles through the strategy.
@@ -270,6 +271,11 @@ def run_backtest(
 
             if not risk.can_trade(candle_ts, equity):
                 continue
+
+            if post_stop_candles > 0 and symbol in last_exit_candle:
+                candles_since_exit = i - last_exit_candle[symbol]
+                if candles_since_exit < post_stop_candles:
+                    continue
 
             if cooldown_candles > 0 and symbol in last_exit_candle:
                 candles_since_exit = i - last_exit_candle[symbol]
@@ -427,7 +433,7 @@ _SETTINGS_FLOATS = {
 _SETTINGS_INTS = {
     "POLL_SECONDS", "LOOKBACK_CANDLES", "MAX_CONSECUTIVE_LOSSES",
     "FAST_EMA", "SLOW_EMA", "ATR_PERIOD", "HEARTBEAT_INTERVAL",
-    "COOLDOWN_CANDLES", "LIMIT_TIMEOUT_SECONDS",
+    "COOLDOWN_CANDLES", "POST_STOP_CANDLES", "LIMIT_TIMEOUT_SECONDS",
 }
 
 
@@ -496,9 +502,11 @@ def main() -> None:
                 break
 
     cooldown = args.cooldown if args.cooldown is not None else settings.cooldown_candles
+    post_stop = settings.post_stop_candles
 
     flags: list[str] = []
     flags.append(f"cooldown={cooldown}")
+    flags.append(f"post_stop={post_stop}")
     if htf_candles_by_symbol:
         flags.append(f"htf={settings.htf_timeframe}")
     if settings.volume_min_mult > 0:
@@ -512,6 +520,7 @@ def main() -> None:
     result = run_backtest(
         settings, candles_by_symbol,
         cooldown_candles=cooldown,
+        post_stop_candles=post_stop,
         htf_candles_by_symbol=htf_candles_by_symbol,
     )
     print_report(result, label=args.label)

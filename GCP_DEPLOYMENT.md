@@ -147,10 +147,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/crypto-trade-bot
+User=mrx10210
+WorkingDirectory=/home/mrx10210/crypto-trade-bot
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/YOUR_USER/crypto-trade-bot/.venv/bin/python -m src.main
+ExecStart=/home/mrx10210/crypto-trade-bot/.venv/bin/python -m src.main
 Restart=always
 RestartSec=5
 
@@ -159,10 +159,10 @@ WantedBy=multi-user.target
 EOF
 ```
 
-Replace `YOUR_USER` in the file:
+Replace `mrx10210` in the file:
 
 ```bash
-sudo sed -i "s/YOUR_USER/$(whoami)/g" /etc/systemd/system/crypto-bot.service
+sudo sed -i "s/mrx10210/$(whoami)/g" /etc/systemd/system/crypto-bot.service
 ```
 
 Enable and start service:

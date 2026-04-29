@@ -274,7 +274,7 @@ class _BrokerBase:
         self.equity: float = settings.initial_equity
         self.positions: Dict[str, Position] = {}
         self.pending_orders: Dict[str, PendingOrder] = {}
-        self.logs_dir = Path("logs")
+        self.logs_dir = Path(settings.logs_dir)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
     def _now(self) -> datetime:

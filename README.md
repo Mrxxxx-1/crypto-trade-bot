@@ -27,9 +27,12 @@ Runs in paper mode by default -- live trading is intentionally disabled.
 | Consecutive losses | Streak >= `MAX_CONSECUTIVE_LOSSES` | Halt all trading for `CONSEC_HALT_HOURS` |
 | Rolling drawdown | Drawdown from window start >= `MAX_DAILY_LOSS_PCT` | Halt all trading for `DAILY_LOSS_HALT_HOURS` |
 | Cooldown | After a stop exit | Block same-direction re-entry for `COOLDOWN_CANDLES` x timeframe minutes |
+| Post-stop pause | After a stop/trail exit | Block any-direction re-entry for `POST_STOP_CANDLES` x timeframe minutes |
 
 Halts are **timer-based** -- the bot automatically resumes after the configured hours. The risk window (equity baseline + loss streak) resets when a halt expires.
 
+Recommended from recent backtests: `POST_STOP_CANDLES=1`, `COOLDOWN_CANDLES=0`.
+post_stop=2, cooldown=12
 ## Quick Start
 
 ### 1. Python environment
@@ -131,6 +134,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `CONSEC_HALT_HOURS` | `6` | Hours to pause after consecutive-loss halt |
 | `DAILY_LOSS_HALT_HOURS` | `12` | Hours to pause after drawdown halt |
 | `COOLDOWN_CANDLES` | `0` | Candles to wait after stop exit before same-direction re-entry |
+| `POST_STOP_CANDLES` | `0` | Candles to wait after stop/trail exit before any-direction re-entry |
 
 ### Strategy
 
