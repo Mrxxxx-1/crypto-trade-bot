@@ -258,7 +258,9 @@ class FuturesBot:
         side = self._entry_side(signal)
 
         current_price = self.exchange.fetch_last_price(symbol)
-        fee_edge_bps = max(0.0, self.settings.exit_fee_bps - self.settings.entry_fee_bps)
+        fee_edge_bps = max(
+            0.0, self.settings.exit_fee_bps - self.settings.entry_fee_bps
+        )
         tolerance = current_price * (fee_edge_bps / 10_000)
         if signal == "long":
             limit_price = current_price + tolerance
@@ -331,9 +333,12 @@ class FuturesBot:
                 break
             except Exception as exc:  # noqa: BLE001
                 print(f"[{self._utc_now()}] ERROR {exc}")
-                self.broker.log_event("error", {
-                    "loop": self.loop_count,
-                    "message": str(exc),
-                    "type": type(exc).__name__,
-                })
+                self.broker.log_event(
+                    "error",
+                    {
+                        "loop": self.loop_count,
+                        "message": str(exc),
+                        "type": type(exc).__name__,
+                    },
+                )
                 time.sleep(max(3, self.settings.poll_seconds // 2))

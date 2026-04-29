@@ -77,6 +77,7 @@ class Settings:
     slippage_bps: float
     limit_timeout_seconds: int
     heartbeat_interval: int
+    logs_dir: str
 
     # Optional: daily Telegram briefing via Gemini (see ``src.briefing``)
     daily_briefing_enabled: bool
@@ -142,6 +143,7 @@ def load_settings() -> Settings:
         slippage_bps=_as_float("SLIPPAGE_BPS", 2),
         limit_timeout_seconds=_as_int("LIMIT_TIMEOUT_SECONDS", 30),
         heartbeat_interval=max(1, _as_int("HEARTBEAT_INTERVAL", 1)),
+        logs_dir=os.getenv("LOGS_DIR", "logs").strip() or "logs",
         daily_briefing_enabled=os.getenv("DAILY_BRIEFING_ENABLED", "").lower()
         in ("1", "true", "yes"),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
