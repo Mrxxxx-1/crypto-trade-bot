@@ -61,7 +61,7 @@ pip install -r requirements.txt
 ## 5) Configure
 
 ```bash
-cp .env.production-paper .env
+cp .env.example .env
 nano .env          # or vim / your editor
 mkdir -p logs
 ```
@@ -265,7 +265,7 @@ pip install -r requirements.txt
 5) Restore `.env` (or use paper defaults) and run smoke test:
 
 ```bash
-cp ~/bot-env-backup-*.env .env 2>/dev/null || cp .env.production-paper .env
+cp ~/bot-env-backup-*.env .env 2>/dev/null || cp .env.example .env
 chmod 600 .env
 mkdir -p logs
 python -m src.main
