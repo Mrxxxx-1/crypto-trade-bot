@@ -20,7 +20,7 @@ from hyperliquid.info import Info
 from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 
 from .config import Settings
-from .models import PendingOrder, Position, Side, TradeResult
+from .models import Leg, PendingOrder, Position, Side, TradeResult
 
 T = TypeVar("T")
 
@@ -418,16 +418,91 @@ class PaperBroker(_BrokerBase):
         return pos
 
     # ------------------------------------------------------------------
-    # Close at exact price level (matches backtest exit model)
+    # DCA leg flow (new strategy entry point)
     # ------------------------------------------------------------------
 
-    def close_position_at(
+    def open_leg(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        fill_price: float,
+    ) -> Optional[Position]:
+        """Add one leg to a (new or existing) composite position.
+
+        Paper-mode fills are immediate at ``fill_price`` with entry slippage applied.
+        Recomputes the composite ``size`` (sum) and ``entry_price``
+        (size-weighted average) after the leg is appended.  Returns the
+        updated ``Position``, or None if size is non-positive.
+        """
+        if size <= 0:
+            return None
+
+        slip = self.settings.slippage_bps / 10_000
+        if side == "buy":
+            entry_px = fill_price * (1 + slip)
+        else:
+            entry_px = fill_price * (1 - slip)
+
+        notional = entry_px * size
+        fee = self._entry_fee(notional)
+        self.equity -= fee
+
+        leg = Leg(
+            size=size,
+            entry_price=entry_px,
+            opened_at=self._now(),
+            fee=fee,
+        )
+
+        pos = self.positions.get(symbol)
+        if pos is None:
+            pos = Position(
+                symbol=symbol,
+                side=side,
+                size=size,
+                entry_price=entry_px,
+                opened_at=self._now(),
+                legs=[leg],
+                last_fill_price=entry_px,
+                peak_price=entry_px,
+            )
+            self.positions[symbol] = pos
+        else:
+            pos.legs.append(leg)
+            total_size = sum(l.size for l in pos.legs)
+            weighted = sum(l.size * l.entry_price for l in pos.legs) / total_size
+            pos.size = total_size
+            pos.entry_price = weighted
+            pos.last_fill_price = entry_px
+
+        self.log_event(
+            "leg_open",
+            {
+                "symbol": symbol,
+                "side": side,
+                "leg_index": len(pos.legs),
+                "leg_size": size,
+                "leg_entry_price": entry_px,
+                "avg_entry_price": pos.entry_price,
+                "total_size": pos.size,
+                "fee": fee,
+                "equity": self.equity,
+            },
+        )
+        return pos
+
+    def close_all_legs(
         self,
         symbol: str,
         exit_at: float,
         exit_reason: str,
     ) -> Optional[TradeResult]:
-        """Close position at an exact stop/TP level with slippage applied."""
+        """Close every leg of a composite position at once.
+
+        Computes net P/L as ``(exit_px - avg_entry) * total_size - exit_fee``
+        (long-only, but signed correctly for shorts in case of future use).
+        """
         pos = self.positions.get(symbol)
         if not pos:
             return None
@@ -439,10 +514,11 @@ class PaperBroker(_BrokerBase):
         else:
             exit_px = exit_at * (1 - slip)
 
-        notional = exit_px * pos.size
+        total_size = pos.size
+        notional = exit_px * total_size
         fee = self._exit_fee(notional)
 
-        raw_pnl = (exit_px - pos.entry_price) * pos.size
+        raw_pnl = (exit_px - pos.entry_price) * total_size
         if pos.side == "sell":
             raw_pnl = -raw_pnl
         net_pnl = raw_pnl - fee
@@ -451,14 +527,15 @@ class PaperBroker(_BrokerBase):
         trade = TradeResult(
             symbol=symbol,
             side=pos.side,
-            size=pos.size,
+            size=total_size,
             entry_price=pos.entry_price,
             exit_price=exit_px,
             pnl=net_pnl,
-            fees=fee,
+            fees=fee + sum(l.fee for l in pos.legs),
             opened_at=pos.opened_at,
             closed_at=self._now(),
             exit_reason=exit_reason,
+            legs=len(pos.legs),
         )
         del self.positions[symbol]
         payload = asdict(trade)
@@ -472,7 +549,8 @@ class PaperBroker(_BrokerBase):
                 "symbol": trade.symbol,
                 "side": trade.side,
                 "size": trade.size,
-                "entry_price": trade.entry_price,
+                "legs": trade.legs,
+                "avg_entry_price": trade.entry_price,
                 "exit_price": trade.exit_price,
                 "pnl": trade.pnl,
                 "fees": trade.fees,
@@ -481,6 +559,23 @@ class PaperBroker(_BrokerBase):
             },
         )
         return trade
+
+    # ------------------------------------------------------------------
+    # Close at exact price level (legacy single-leg exit, kept for compat)
+    # ------------------------------------------------------------------
+
+    def close_position_at(
+        self,
+        symbol: str,
+        exit_at: float,
+        exit_reason: str,
+    ) -> Optional[TradeResult]:
+        """Close position at an exact stop/TP level with slippage applied.
+
+        Deprecated in favour of ``close_all_legs`` under the DCA strategy.
+        Forwards to ``close_all_legs`` so legacy callers keep working.
+        """
+        return self.close_all_legs(symbol, exit_at, exit_reason)
 
 
 class LiveBroker(_BrokerBase):
@@ -626,15 +721,85 @@ class LiveBroker(_BrokerBase):
         return True
 
     # ------------------------------------------------------------------
-    # Close via market order (reduceOnly)
+    # DCA leg flow (new strategy entry point)
     # ------------------------------------------------------------------
 
-    def close_position_at(
+    def open_leg(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        fill_price: float,
+    ) -> Optional[Position]:
+        """Add one leg to a (new or existing) composite position via market order.
+
+        ``fill_price`` is only used as a fallback if the exchange response
+        doesn't include an average fill price.  Returns the updated Position,
+        or None if the order errored or sized to zero.
+        """
+        if size <= 0:
+            return None
+        try:
+            resp = self.exchange.create_market_order(symbol, side, size, params={})
+        except Exception as exc:
+            self.log_event("order_error", {"symbol": symbol, "error": str(exc)})
+            return None
+
+        entry_px = float(resp.get("average", fill_price) or fill_price)
+        filled = float(resp.get("filled", size) or size)
+        self._sync_equity()
+
+        fee = self._entry_fee(entry_px * filled)
+        leg = Leg(
+            size=filled,
+            entry_price=entry_px,
+            opened_at=self._now(),
+            fee=fee,
+        )
+
+        pos = self.positions.get(symbol)
+        if pos is None:
+            pos = Position(
+                symbol=symbol,
+                side=side,
+                size=filled,
+                entry_price=entry_px,
+                opened_at=self._now(),
+                legs=[leg],
+                last_fill_price=entry_px,
+                peak_price=entry_px,
+            )
+            self.positions[symbol] = pos
+        else:
+            pos.legs.append(leg)
+            total_size = sum(l.size for l in pos.legs)
+            weighted = sum(l.size * l.entry_price for l in pos.legs) / total_size
+            pos.size = total_size
+            pos.entry_price = weighted
+            pos.last_fill_price = entry_px
+
+        self.log_event(
+            "leg_open",
+            {
+                "symbol": symbol,
+                "side": side,
+                "leg_index": len(pos.legs),
+                "leg_size": filled,
+                "leg_entry_price": entry_px,
+                "avg_entry_price": pos.entry_price,
+                "total_size": pos.size,
+                "equity": self.equity,
+            },
+        )
+        return pos
+
+    def close_all_legs(
         self,
         symbol: str,
         exit_at: float,
         exit_reason: str,
     ) -> Optional[TradeResult]:
+        """Close the entire composite position via a single reduceOnly market order."""
         pos = self.positions.get(symbol)
         if not pos:
             return None
@@ -652,25 +817,27 @@ class LiveBroker(_BrokerBase):
             return None
 
         fill_price = float(resp.get("average", exit_at) or exit_at)
+        total_size = pos.size
         self._sync_equity()
 
-        raw_pnl = (fill_price - pos.entry_price) * pos.size
+        raw_pnl = (fill_price - pos.entry_price) * total_size
         if pos.side == "sell":
             raw_pnl = -raw_pnl
-        fee = self._exit_fee(fill_price * pos.size)
+        fee = self._exit_fee(fill_price * total_size)
         net_pnl = raw_pnl - fee
 
         trade = TradeResult(
             symbol=symbol,
             side=pos.side,
-            size=pos.size,
+            size=total_size,
             entry_price=pos.entry_price,
             exit_price=fill_price,
             pnl=net_pnl,
-            fees=fee,
+            fees=fee + sum(l.fee for l in pos.legs),
             opened_at=pos.opened_at,
             closed_at=self._now(),
             exit_reason=exit_reason,
+            legs=len(pos.legs),
         )
         del self.positions[symbol]
 
@@ -685,7 +852,8 @@ class LiveBroker(_BrokerBase):
                 "symbol": trade.symbol,
                 "side": trade.side,
                 "size": trade.size,
-                "entry_price": trade.entry_price,
+                "legs": trade.legs,
+                "avg_entry_price": trade.entry_price,
                 "exit_price": trade.exit_price,
                 "pnl": trade.pnl,
                 "fees": trade.fees,
@@ -694,3 +862,16 @@ class LiveBroker(_BrokerBase):
             },
         )
         return trade
+
+    # ------------------------------------------------------------------
+    # Legacy single-leg exit, kept for back-compat
+    # ------------------------------------------------------------------
+
+    def close_position_at(
+        self,
+        symbol: str,
+        exit_at: float,
+        exit_reason: str,
+    ) -> Optional[TradeResult]:
+        """Deprecated: forwards to ``close_all_legs``."""
+        return self.close_all_legs(symbol, exit_at, exit_reason)

@@ -1,37 +1,31 @@
-"""EMA crossover + ATR volatility filter strategy.
+"""Long-only DCA-on-dips strategy.
 
-``generate_signal`` expects **closed candles only** (the forming candle must
-be excluded by the caller).  ``htf_trend`` applies the same EMA logic on a
-higher-timeframe series; ``volume_ok`` gates entries on minimum volume.
+Lifecycle, per symbol:
+  1. **Initial leg**: open a long when ``last_close <= local_high * (1 - initial_dip_pct/100)``
+     AND ``last_close <= settings.max_price_for(symbol)``.
+  2. **DCA adds**: while position is open and legs < ``max_dca_legs``, open another leg
+     when ``last_close <= last_fill_price * (1 - dca_trigger_pct/100)`` (cap filter still applies).
+  3. **Arm trailing**: once ``last_close >= avg_entry_price * (1 + trail_activate_pct/100)``.
+  4. **Exit (all legs)**: once armed, ratchet ``peak_price`` to the running high and
+     exit when ``last_close <= peak_price * (1 - trail_distance_pct/100)``.
+
+No hard SL, no fixed TP. Shorts are disabled.
+``compute_atr`` is retained for diagnostic / logging callers; it no longer drives
+sizing or stops.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 
 from .config import Settings
-from .models import Signal
-
-
-def _ema(values: List[float], period: int) -> float:
-    if len(values) < period:
-        return values[-1]
-    multiplier = 2 / (period + 1)
-    ema_value = values[0]
-    for value in values[1:]:
-        ema_value = (value - ema_value) * multiplier + ema_value
-    return ema_value
 
 
 def compute_atr(ohlcv: List[List[float]], period: int) -> float:
     """Return the Average True Range over the last *period* candles.
 
-    Public wrapper so ``bot.py`` and ``backtest.py`` can compute ATR on
-    arbitrary candle series (e.g. HTF candles for wider stop placement).
+    Kept for backward compatibility and diagnostics; not used to size positions
+    or place stops under the DCA strategy.
     """
-    return _atr(ohlcv, period)
-
-
-def _atr(ohlcv: List[List[float]], period: int) -> float:
     if len(ohlcv) < period + 1:
         return 0.0
     trs: List[float] = []
@@ -45,57 +39,79 @@ def _atr(ohlcv: List[List[float]], period: int) -> float:
     return sum(recent) / len(recent)
 
 
-def generate_signal(ohlcv: List[List[float]], settings: Settings) -> Tuple[Signal, float]:
-    """Return ``(signal, atr)`` from closed candle data.
+def local_high(ohlcv: List[List[float]], lookback: int) -> float:
+    """Return the maximum high price over the last ``lookback`` candles.
 
-    Long when fast EMA > slow EMA, short when fast < slow.
-    Returns ``("flat", atr)`` when ATR < ``atr_min_pct`` or data is too short.
+    Falls back to the max over whatever data is available if the series is
+    shorter than ``lookback``.  Returns 0.0 only if the series is empty.
     """
-    closes = [float(c[4]) for c in ohlcv]
-    if len(closes) < max(settings.fast_ema, settings.slow_ema) + 2:
-        return "flat", 0.0
-
-    fast = _ema(closes[-settings.fast_ema :], settings.fast_ema)
-    slow = _ema(closes[-settings.slow_ema :], settings.slow_ema)
-    atr_value = _atr(ohlcv, settings.atr_period)
-    last_close = closes[-1]
-
-    if last_close <= 0:
-        return "flat", atr_value
-
-    atr_pct = (atr_value / last_close) * 100
-    if atr_pct < settings.atr_min_pct:
-        return "flat", atr_value
-
-    if fast > slow:
-        return "long", atr_value
-    if fast < slow:
-        return "short", atr_value
-    return "flat", atr_value
+    if not ohlcv:
+        return 0.0
+    window = ohlcv[-lookback:] if lookback > 0 else ohlcv
+    return max(float(c[2]) for c in window)
 
 
-def htf_trend(htf_ohlcv: List[List[float]], settings: Settings) -> Signal:
-    """Return the higher-timeframe trend direction using the same EMA logic."""
-    closes = [float(c[4]) for c in htf_ohlcv]
-    if len(closes) < max(settings.fast_ema, settings.slow_ema) + 2:
-        return "flat"
-    fast = _ema(closes[-settings.fast_ema :], settings.fast_ema)
-    slow = _ema(closes[-settings.slow_ema :], settings.slow_ema)
-    if fast > slow:
-        return "long"
-    if fast < slow:
-        return "short"
-    return "flat"
+def entry_trigger(ohlcv: List[List[float]], settings: Settings) -> bool:
+    """True if a qualifying dip happened recently AND (optionally) the latest bar confirms.
+
+    Logic:
+      1. Compute ``threshold = local_high(lookback) * (1 - initial_dip_pct/100)``.
+      2. ``recent_dip``: any of the last ``dip_memory_bars`` closed bars closed at or below ``threshold``.
+         This gives the entry a short memory window so we don't miss it on a fast bounce.
+      3. ``green_ok``: if ``require_green_confirmation`` is True, the most recent closed bar
+         must be bullish (close > open).  Filters out catching a still-falling knife.
+
+    Returns True only when both conditions pass.  Requires at least 2 candles.
+    """
+    if len(ohlcv) < 2:
+        return False
+    high = local_high(ohlcv, settings.high_lookback_candles)
+    if high <= 0:
+        return False
+    threshold = high * (1.0 - settings.initial_dip_pct / 100.0)
+
+    memory = max(1, settings.dip_memory_bars)
+    recent = ohlcv[-memory:]
+    recent_dip = any(float(c[4]) <= threshold for c in recent)
+    if not recent_dip:
+        return False
+
+    if settings.require_green_confirmation:
+        last_open = float(ohlcv[-1][1])
+        last_close = float(ohlcv[-1][4])
+        if last_close <= last_open:
+            return False
+
+    return True
 
 
-def volume_ok(ohlcv: List[List[float]], period: int, min_mult: float) -> bool:
-    """Return True if the latest candle's volume meets the minimum threshold."""
-    if min_mult <= 0:
-        return True
-    if len(ohlcv) < period + 1:
-        return True
-    volumes = [float(c[5]) for c in ohlcv[-(period + 1) :]]
-    avg_vol = sum(volumes[:-1]) / max(len(volumes) - 1, 1)
-    if avg_vol <= 0:
-        return True
-    return volumes[-1] >= avg_vol * min_mult
+def dca_trigger(last_close: float, last_fill_price: float, settings: Settings) -> bool:
+    """True if price has dropped >= ``dca_trigger_pct`` below the most recent leg's fill."""
+    if last_fill_price <= 0 or last_close <= 0:
+        return False
+    threshold = last_fill_price * (1.0 - settings.dca_trigger_pct / 100.0)
+    return last_close <= threshold
+
+
+def should_arm_trail(avg_cost: float, last_close: float, settings: Settings) -> bool:
+    """True once net unrealized P&L reaches ``trail_activate_pct`` above avg cost."""
+    if avg_cost <= 0:
+        return False
+    threshold = avg_cost * (1.0 + settings.trail_activate_pct / 100.0)
+    return last_close >= threshold
+
+
+def trail_stop_price(peak_price: float, settings: Settings) -> float:
+    """Return the trailing-stop price = ``peak_price * (1 - trail_distance_pct/100)``."""
+    if peak_price <= 0:
+        return 0.0
+    return peak_price * (1.0 - settings.trail_distance_pct / 100.0)
+
+
+def price_in_zone(symbol: str, last_close: float, settings: Settings) -> bool:
+    """True if ``last_close`` is at or below the symbol's long-entry ceiling.
+
+    Uncapped symbols (not listed in ``LONG_MAX_PRICES``) pass through.
+    """
+    cap = settings.max_price_for(symbol)
+    return last_close <= cap

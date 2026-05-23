@@ -1,37 +1,35 @@
-"""Main trading loop: poll OHLCV, generate signals from closed candles,
-check exits via current candle high/low, manage limit entries, cooldown,
-and risk halts.
+"""Main trading loop: long-only DCA-on-dips with trailing-stop exit.
+
+Per tick, per symbol:
+  1. Fetch OHLCV (closed candles for triggers, current candle high/low for trail checks).
+  2. If a position is open: maybe arm or update the trailing stop; exit (all legs)
+     if armed and price <= trail level; otherwise consider a DCA add if last close has
+     dropped >= ``dca_trigger_pct`` below the most recent leg's fill price.
+  3. If no position: enter the first leg if price is in zone, the entry trigger fires,
+     and risk guards allow new trades.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict
 
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
-from .models import Side
 from .risk import RiskManager
-from .strategy import compute_atr, generate_signal, htf_trend, volume_ok
-
-
-@dataclass
-class SymbolState:
-    """Per-symbol state for cooldown tracking.
-
-    After a stop exit, ``last_exit_ts`` and ``last_exit_side`` enforce a
-    ``COOLDOWN_CANDLES * timeframe_minutes`` wait before re-entering the
-    same direction.
-    """
-
-    last_exit_side: str = ""
-    last_exit_ts: Optional[datetime] = None
+from .strategy import (
+    dca_trigger,
+    entry_trigger,
+    local_high,
+    price_in_zone,
+    should_arm_trail,
+    trail_stop_price,
+)
 
 
 class FuturesBot:
-    """Paper futures bot: polls Hyperliquid, runs strategy, and manages risk per tick."""
+    """Long-only DCA bot: polls Hyperliquid, scales into dips, exits via trailing stop."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -41,46 +39,21 @@ class FuturesBot:
             self.broker: PaperBroker | LiveBroker = LiveBroker(settings, self.exchange)
         else:
             self.broker = PaperBroker(settings, self.exchange)
-        self.states: Dict[str, SymbolState] = {
-            symbol: SymbolState() for symbol in settings.symbols
-        }
+        self.starting_equity = settings.initial_equity
         self.loop_count = 0
 
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def _entry_side(self, signal: str) -> Side:
-        return "buy" if signal == "long" else "sell"
-
-    def _stops(self, signal: str, price: float, atr: float) -> tuple[float, float]:
-        """Return ``(stop_price, take_profit_price)`` based on ATR and ``TAKE_PROFIT_R``."""
-        stop_distance = atr * self.settings.stop_atr_multiplier
-        if signal == "long":
-            stop = price - stop_distance
-            take = price + (stop_distance * self.settings.take_profit_r)
-        else:
-            stop = price + stop_distance
-            take = price - (stop_distance * self.settings.take_profit_r)
-        return stop, take
-
-    def _timeframe_minutes(self) -> int:
-        """Parse timeframe string (e.g. ``5m``, ``1h``) into total minutes."""
-        tf = self.settings.timeframe
-        if tf.endswith("m"):
-            return int(tf[:-1])
-        if tf.endswith("h"):
-            return int(tf[:-1]) * 60
-        if tf.endswith("d"):
-            return int(tf[:-1]) * 1440
-        return 5
+    def _unrealized_pct(self, avg_entry: float, last_close: float) -> float:
+        if avg_entry <= 0:
+            return 0.0
+        return (last_close / avg_entry - 1.0) * 100.0
 
     def _process_symbol(self, symbol: str) -> str:
         """Process one symbol per tick.
 
-        1. Use closed candles for signal generation, current candle for exits.
-        2. Check / fill / timeout pending limit orders.
-        3. Exit via candle high/low against stop/TP (skip entry candle).
-        4. Enter new positions after cooldown, risk, and filter checks.
+        Returns a short status string for heartbeat logging.
         """
         ohlcv = self.exchange.fetch_ohlcv(
             symbol,
@@ -90,7 +63,6 @@ class FuturesBot:
         if len(ohlcv) < 2:
             return f"{symbol} insufficient_data"
 
-        # Closed candles for signal; last candle (possibly forming) for exit checks
         closed_candles = ohlcv[:-1]
         current_candle = ohlcv[-1]
         current_candle_ts = datetime.fromtimestamp(
@@ -101,209 +73,129 @@ class FuturesBot:
         current_low = float(current_candle[3])
         last_close = float(closed_candles[-1][4])
 
-        signal, atr = generate_signal(closed_candles, self.settings)
-        atr_pct = (atr / last_close * 100) if last_close > 0 else 0.0
-
-        # --- 1. Check pending limit orders ---
-        if symbol in self.broker.pending_orders:
-            if self.broker.is_pending_expired(symbol):
-                self.broker.cancel_pending(symbol)
-                print(f"[{self._utc_now()}] CANCEL limit order {symbol} (timeout)")
-            else:
-                pos = self.broker.check_pending_fill(symbol)
-                if pos:
-                    pos.entry_candle_ts = current_candle_ts
-                    print(
-                        f"[{self._utc_now()}] FILLED {symbol} {pos.side} size={pos.size:.6f} "
-                        f"entry={pos.entry_price:.2f} equity={self.broker.equity:.2f}"
-                    )
-                else:
-                    return f"{symbol} pending_fill limit={self.broker.pending_orders[symbol].limit_price:.2f}"
-
-        # --- 2. Exit checks for active positions ---
+        # --- 1. Manage open position (trail / exit / DCA) ---
         if symbol in self.broker.positions:
             pos = self.broker.positions[symbol]
 
-            # Skip exit on entry candle (matches backtest)
-            if (
-                pos.entry_candle_ts is not None
-                and current_candle_ts <= pos.entry_candle_ts
-            ):
-                return (
-                    f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
-                    f"now={float(current_candle[4]):.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f} (entry_candle)"
+            if not pos.trail_armed and should_arm_trail(pos.entry_price, last_close, self.settings):
+                pos.trail_armed = True
+                pos.peak_price = max(pos.peak_price, current_high, last_close)
+                pos.stop_price = trail_stop_price(pos.peak_price, self.settings)
+                self.broker.log_event(
+                    "trail_armed",
+                    {
+                        "symbol": symbol,
+                        "avg_entry_price": pos.entry_price,
+                        "last_close": last_close,
+                        "peak_price": pos.peak_price,
+                        "stop_price": pos.stop_price,
+                    },
+                )
+                print(
+                    f"[{self._utc_now()}] TRAIL ARMED {symbol} avg={pos.entry_price:.2f} "
+                    f"peak={pos.peak_price:.2f} stop={pos.stop_price:.2f}"
                 )
 
-            # Trailing stop: update peak and ratchet stop before exit checks
-            trail_active = False
-            if self.settings.trail_after_r > 0 and pos.initial_stop_distance > 0:
-                if pos.side == "buy":
-                    pos.peak_price = max(pos.peak_price, current_high)
-                    profit = pos.peak_price - pos.entry_price
-                else:
-                    pos.peak_price = min(pos.peak_price, current_low)
-                    profit = pos.entry_price - pos.peak_price
-
-                activation = pos.initial_stop_distance * self.settings.trail_after_r
-                if profit >= activation and pos.trail_atr > 0:
-                    trail_active = True
-                    trail_dist = pos.trail_atr * self.settings.trail_atr_multiplier
-                    if pos.side == "buy":
-                        pos.stop_price = max(
-                            pos.stop_price, pos.peak_price - trail_dist
+            if pos.trail_armed:
+                if current_high > pos.peak_price:
+                    pos.peak_price = current_high
+                    pos.stop_price = trail_stop_price(pos.peak_price, self.settings)
+                # exit if intrabar low touches trail
+                if current_low <= pos.stop_price:
+                    trade = self.broker.close_all_legs(symbol, pos.stop_price, "trail")
+                    if trade:
+                        self.risk.on_trade_close(trade.pnl, self.broker.equity)
+                        print(
+                            f"[{self._utc_now()}] EXIT {symbol} trail pnl={trade.pnl:+.2f} "
+                            f"legs={trade.legs} avg={trade.entry_price:.2f} exit={trade.exit_price:.2f} "
+                            f"equity={self.broker.equity:.2f}"
                         )
-                    else:
-                        pos.stop_price = min(
-                            pos.stop_price, pos.peak_price + trail_dist
+                        return (
+                            f"{symbol} exited trail pnl={trade.pnl:+.2f} legs={trade.legs}"
                         )
 
-            # Check stop/TP using candle high/low (matches backtest)
-            hit_stop = hit_tp = False
-            if pos.side == "buy":
-                hit_stop = current_low <= pos.stop_price
-                hit_tp = current_high >= pos.take_profit_price
-            else:
-                hit_stop = current_high >= pos.stop_price
-                hit_tp = current_low <= pos.take_profit_price
-
-            if hit_stop or hit_tp:
-                if hit_stop:
-                    exit_at = pos.stop_price
-                    reason = "trail" if trail_active else "stop"
-                else:
-                    exit_at = pos.take_profit_price
-                    reason = "tp"
-
-                trade = self.broker.close_position_at(symbol, exit_at, reason)
-                if trade:
-                    self.risk.on_trade_close(trade.pnl, self.broker.equity)
-                    if reason in ("stop", "trail"):
-                        state = self.states[symbol]
-                        state.last_exit_side = trade.side
-                        state.last_exit_ts = datetime.now(timezone.utc)
-                    print(
-                        f"[{self._utc_now()}] EXIT {symbol} {reason} pnl={trade.pnl:.2f} "
-                        f"equity={self.broker.equity:.2f}"
-                    )
-
+            # if still open, consider DCA add
             if symbol in self.broker.positions:
                 pos = self.broker.positions[symbol]
+                if len(pos.legs) < self.settings.max_dca_legs:
+                    if dca_trigger(last_close, pos.last_fill_price, self.settings):
+                        if price_in_zone(symbol, last_close, self.settings):
+                            if self.risk.can_trade(self.broker.equity):
+                                add_size = self.risk.calc_leg_size(
+                                    self.starting_equity, last_close
+                                )
+                                if add_size > 0:
+                                    new_pos = self.broker.open_leg(
+                                        symbol, "buy", add_size, last_close
+                                    )
+                                    if new_pos:
+                                        u_pct = self._unrealized_pct(new_pos.entry_price, last_close)
+                                        print(
+                                            f"[{self._utc_now()}] DCA ADD {symbol} leg={len(new_pos.legs)}/{self.settings.max_dca_legs} "
+                                            f"size={add_size:.6f} px={last_close:.2f} "
+                                            f"avg={new_pos.entry_price:.2f} ({u_pct:+.2f}%) equity={self.broker.equity:.2f}"
+                                        )
+
+                pos = self.broker.positions[symbol]
+                u_pct = self._unrealized_pct(pos.entry_price, last_close)
+                trail_state = (
+                    f"trail peak={pos.peak_price:.2f} stop={pos.stop_price:.2f}"
+                    if pos.trail_armed
+                    else f"trail off (need {pos.entry_price * (1 + self.settings.trail_activate_pct / 100):.2f})"
+                )
                 return (
-                    f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
-                    f"now={float(current_candle[4]):.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f}"
+                    f"{symbol} in_position legs={len(pos.legs)}/{self.settings.max_dca_legs} "
+                    f"avg={pos.entry_price:.2f} last={last_close:.2f} ({u_pct:+.2f}%) {trail_state}"
                 )
 
-        # --- 3. Check for new entry ---
-        if signal == "flat" or atr <= 0:
-            return f"{symbol} no_entry signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
+        # --- 2. No position: maybe open the first leg ---
+        if not price_in_zone(symbol, last_close, self.settings):
+            cap = self.settings.max_price_for(symbol)
+            return f"{symbol} no_entry above_cap last={last_close:.2f} cap={cap:.2f}"
 
-        if self.settings.volume_min_mult > 0:
-            if not volume_ok(
-                closed_candles, self.settings.atr_period, self.settings.volume_min_mult
-            ):
-                return f"{symbol} no_entry low_volume signal={signal} last={last_close:.2f}"
-
-        htf_closed: list | None = None
-        if self.settings.htf_timeframe:
-            htf_ohlcv = self.exchange.fetch_ohlcv(
-                symbol,
-                self.settings.htf_timeframe,
-                self.settings.lookback_candles + 1,
+        if not entry_trigger(closed_candles, self.settings):
+            high = local_high(closed_candles, self.settings.high_lookback_candles)
+            need = high * (1.0 - self.settings.initial_dip_pct / 100.0)
+            return (
+                f"{symbol} no_entry no_dip last={last_close:.2f} "
+                f"high={high:.2f} need<={need:.2f}"
             )
-            if len(htf_ohlcv) > 1:
-                htf_closed = htf_ohlcv[:-1]
-            else:
-                htf_closed = htf_ohlcv
-            htf = htf_trend(htf_closed, self.settings)
-            if htf != signal:
-                return f"{symbol} no_entry htf_disagree signal={signal} htf={htf} last={last_close:.2f}"
 
         if not self.risk.can_trade(self.broker.equity):
-            print(f"[{self._utc_now()}] HALT risk guard active, no new trades")
-            return f"{symbol} blocked_by_risk signal={signal} atr_pct={atr_pct:.3f}"
+            print(f"[{self._utc_now()}] HALT risk guard active, no new trades {symbol}")
+            return f"{symbol} blocked_by_risk last={last_close:.2f}"
 
-        state = self.states[symbol]
-        elapsed_min = None
-        if state.last_exit_ts is not None:
-            elapsed_min = (
-                datetime.now(timezone.utc) - state.last_exit_ts
-            ).total_seconds() / 60
+        leg_size = self.risk.calc_leg_size(self.starting_equity, last_close)
+        if leg_size <= 0:
+            return f"{symbol} no_entry size=0 last={last_close:.2f}"
 
-        post_stop_minutes = self.settings.post_stop_candles * self._timeframe_minutes()
-        if (
-            post_stop_minutes > 0
-            and elapsed_min is not None
-            and elapsed_min < post_stop_minutes
-        ):
-            return (
-                f"{symbol} cooldown_post_stop signal={signal} "
-                f"atr_pct={atr_pct:.3f} last={last_close:.2f}"
-            )
-
-        cd_minutes = self.settings.cooldown_candles * self._timeframe_minutes()
-        if cd_minutes > 0 and elapsed_min is not None:
-            same_dir = (signal == "long" and state.last_exit_side == "buy") or (
-                signal == "short" and state.last_exit_side == "sell"
-            )
-            if same_dir and elapsed_min < cd_minutes:
-                return f"{symbol} cooldown signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
-
-        stop_atr = atr
-        if self.settings.stop_atr_source == "htf" and htf_closed:
-            stop_atr = compute_atr(htf_closed, self.settings.atr_period)
-        stop_price, take_price = self._stops(signal, last_close, stop_atr)
-        size = self.risk.calc_position_size(self.broker.equity, last_close, stop_price)
-        if size <= 0:
-            return f"{symbol} no_entry size=0 signal={signal} atr_pct={atr_pct:.3f}"
-        side = self._entry_side(signal)
-
-        current_price = self.exchange.fetch_last_price(symbol)
-        fee_edge_bps = max(
-            0.0, self.settings.exit_fee_bps - self.settings.entry_fee_bps
-        )
-        tolerance = current_price * (fee_edge_bps / 10_000)
-        if signal == "long":
-            limit_price = current_price + tolerance
-        else:
-            limit_price = current_price - tolerance
-
-        init_stop_dist = abs(last_close - stop_price)
-        order = self.broker.place_limit_entry(
-            symbol=symbol,
-            side=side,
-            size=size,
-            limit_price=limit_price,
-            stop_price=stop_price,
-            take_profit_price=take_price,
-            initial_stop_distance=init_stop_dist,
-            trail_atr=stop_atr,
-        )
-        if order:
-            pos = self.broker.check_pending_fill(symbol, known_price=current_price)
-            if pos:
-                pos.entry_candle_ts = current_candle_ts
-                print(
-                    f"[{self._utc_now()}] FILLED {symbol} {pos.side} size={pos.size:.6f} "
-                    f"entry={pos.entry_price:.2f} equity={self.broker.equity:.2f}"
-                )
-                return (
-                    f"{symbol} in_position side={pos.side} size={pos.size:.6f} "
-                    f"last={last_close:.2f} stop={pos.stop_price:.2f} tp={pos.take_profit_price:.2f}"
-                )
+        pos = self.broker.open_leg(symbol, "buy", leg_size, last_close)
+        if pos:
+            pos.entry_candle_ts = current_candle_ts
             print(
-                f"[{self._utc_now()}] LIMIT {symbol} {side} size={size:.6f} price={limit_price:.2f} "
-                f"stop={stop_price:.2f} tp={take_price:.2f}"
+                f"[{self._utc_now()}] OPEN {symbol} leg=1/{self.settings.max_dca_legs} "
+                f"size={leg_size:.6f} px={last_close:.2f} equity={self.broker.equity:.2f}"
             )
             return (
-                f"{symbol} limit_placed side={side} size={size:.6f} price={limit_price:.2f} "
-                f"stop={stop_price:.2f} tp={take_price:.2f}"
+                f"{symbol} opened legs=1/{self.settings.max_dca_legs} "
+                f"avg={pos.entry_price:.2f} last={last_close:.2f}"
             )
-        return f"{symbol} no_entry signal={signal} atr_pct={atr_pct:.3f} last={last_close:.2f}"
+        return f"{symbol} no_entry broker_rejected last={last_close:.2f}"
 
     def run_forever(self) -> None:
         """Main loop: process all symbols, sleep, log heartbeats."""
         print(
-            f"[{self._utc_now()}] Start bot mode={self.settings.mode} symbols={self.settings.symbols}"
+            f"[{self._utc_now()}] Start bot mode={self.settings.mode} "
+            f"symbols={self.settings.symbols} strategy=dca-on-dips"
+        )
+        print(
+            f"  caps: {self.settings.long_max_prices} "
+            f"initial_dip={self.settings.initial_dip_pct}% "
+            f"dca_trigger={self.settings.dca_trigger_pct}% "
+            f"max_legs={self.settings.max_dca_legs} "
+            f"leg_notional={self.settings.leg_notional_pct}% "
+            f"trail_arm={self.settings.trail_activate_pct}% "
+            f"trail_dist={self.settings.trail_distance_pct}%"
         )
         while True:
             try:
@@ -313,7 +205,8 @@ class FuturesBot:
                     statuses.append(self._process_symbol(symbol))
                 if self.loop_count % self.settings.heartbeat_interval == 0:
                     print(
-                        f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} equity={self.broker.equity:.2f} "
+                        f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
+                        f"equity={self.broker.equity:.2f} "
                         f"open_positions={len(self.broker.positions)}"
                     )
                     for status in statuses:
