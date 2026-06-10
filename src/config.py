@@ -115,9 +115,23 @@ class Settings:
     gemini_api_key: str
     daily_briefing_hour_utc: int
 
+    # Web dashboard + agentic control surfaces
+    dashboard_host: str
+    dashboard_port: int
+    telegram_control_enabled: bool
+
     @property
     def is_live(self) -> bool:
         return self.mode.lower().strip() == "live"
+
+    @property
+    def telegram_control_configured(self) -> bool:
+        """Two-way control needs a bot token + an authorized chat id.
+
+        Gemini is optional (only used for natural-language routing); slash
+        commands work without it.
+        """
+        return bool(self.telegram_bot_token.strip() and self.telegram_chat_id.strip())
 
     @property
     def daily_briefing_configured(self) -> bool:
@@ -202,4 +216,8 @@ def load_settings() -> Settings:
         daily_briefing_hour_utc=max(
             0, min(23, _as_int("DAILY_BRIEFING_HOUR_UTC", 6))
         ),
+        dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0",
+        dashboard_port=_as_int("DASHBOARD_PORT", 8000),
+        telegram_control_enabled=os.getenv("TELEGRAM_CONTROL_ENABLED", "").lower()
+        in ("1", "true", "yes"),
     )

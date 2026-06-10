@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crypto Bot Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cpolyline points='4,22 12,14 18,18 28,6' fill='none' stroke='%2358a6ff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='28' cy='6' r='2.5' fill='%233fb950'/%3E%3C/svg%3E" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --green: #3fb950; --red: #f85149; --accent: #58a6ff;
+    --amber: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 16px 24px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .badge { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.live { background: rgba(248,81,73,.15); color: var(--red); }
+  .badge.paper { background: rgba(88,166,255,.15); color: var(--accent); }
+  .badge.running { background: rgba(63,185,80,.15); color: var(--green); }
+  .badge.paused { background: rgba(210,153,34,.15); color: var(--amber); }
+  .spacer { flex: 1; }
+  #updated { color: var(--muted); font-size: 12px; }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  .stat { font-size: 26px; font-weight: 700; }
+  .stat.green { color: var(--green); } .stat.red { color: var(--red); }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--green); } .neg { color: var(--red); }
+  .empty { color: var(--muted); padding: 12px 0; }
+  pre { white-space: pre-wrap; word-break: break-word; color: var(--text);
+    background: #0d1117; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; margin: 0; font-size: 13px; max-height: 320px; overflow:auto; }
+  @media (max-width: 800px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Crypto Bot Dashboard</h1>
+  <span id="mode-badge" class="badge paper">…</span>
+  <span id="state-badge" class="badge running">…</span>
+  <div class="spacer"></div>
+  <span id="updated">loading…</span>
+</header>
+
+<main>
+  <div class="grid">
+    <div class="card"><h2>Equity</h2><div id="equity" class="stat">—</div></div>
+    <div class="card"><h2>Open Positions</h2><div id="open-count" class="stat">—</div></div>
+    <div class="card"><h2>P&amp;L (24h)</h2><div id="pnl24" class="stat">—</div></div>
+    <div class="card"><h2>Win / Loss (24h)</h2><div id="wl24" class="stat">—</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Equity Curve</h2>
+    <canvas id="equityChart" height="90"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>Open Positions</h2>
+    <div id="positions"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Recent Trades</h2>
+    <div id="trades"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Recent Events</h2>
+    <div id="events"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Latest Briefing</h2>
+    <pre id="briefing">—</pre>
+  </div>
+</main>
+
+<script>
+const fmt = (n, d = 2) => (n === null || n === undefined || isNaN(n))
+  ? "—" : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+const cls = (n) => n > 0 ? "pos" : (n < 0 ? "neg" : "");
+let chart;
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " -> " + r.status);
+  return r.json();
+}
+
+function renderStatus(s) {
+  const modeBadge = document.getElementById("mode-badge");
+  modeBadge.textContent = (s.mode || "?").toUpperCase();
+  modeBadge.className = "badge " + (String(s.mode).toLowerCase() === "live" ? "live" : "paper");
+
+  const stateBadge = document.getElementById("state-badge");
+  if (s.paused) {
+    stateBadge.textContent = "PAUSED" + (s.pause_reason ? " — " + s.pause_reason : "");
+    stateBadge.className = "badge paused";
+  } else {
+    stateBadge.textContent = "RUNNING";
+    stateBadge.className = "badge running";
+  }
+
+  document.getElementById("equity").textContent = "$" + fmt(s.equity);
+  document.getElementById("open-count").textContent = s.open_positions ?? "—";
+
+  const posDiv = document.getElementById("positions");
+  if (!s.positions || s.positions.length === 0) {
+    posDiv.innerHTML = '<div class="empty">No open positions.</div>';
+  } else {
+    let h = "<table><tr><th>Symbol</th><th>Legs</th><th class='num'>Size</th>"
+      + "<th class='num'>Avg Entry</th><th class='num'>Stop</th><th>Trail</th></tr>";
+    for (const p of s.positions) {
+      h += `<tr><td>${p.symbol}</td><td>${p.legs}/${p.max_legs}</td>`
+        + `<td class='num'>${fmt(p.size, 6)}</td><td class='num'>${fmt(p.avg_entry)}</td>`
+        + `<td class='num'>${p.trail_armed ? fmt(p.stop_price) : "—"}</td>`
+        + `<td>${p.trail_armed ? "armed" : "off"}</td></tr>`;
+    }
+    posDiv.innerHTML = h + "</table>";
+  }
+}
+
+function renderPnl(p) {
+  const t = p.trades || {};
+  const pnl = t.total_pnl ?? 0;
+  const el = document.getElementById("pnl24");
+  el.textContent = (pnl >= 0 ? "+" : "") + "$" + fmt(pnl);
+  el.className = "stat " + (pnl > 0 ? "green" : pnl < 0 ? "red" : "");
+  document.getElementById("wl24").textContent = `${t.wins ?? 0} / ${t.losses ?? 0}`;
+}
+
+function renderTrades(d) {
+  const div = document.getElementById("trades");
+  const rows = (d.trades || []).slice().reverse();
+  if (rows.length === 0) { div.innerHTML = '<div class="empty">No trades yet.</div>'; return; }
+  let h = "<table><tr><th>Closed</th><th>Symbol</th><th>Side</th><th class='num'>Entry</th>"
+    + "<th class='num'>Exit</th><th class='num'>P&amp;L</th><th>Reason</th></tr>";
+  for (const t of rows) {
+    const when = (t.closed_at || "").replace("T", " ").slice(0, 16);
+    h += `<tr><td>${when}</td><td>${t.symbol}</td><td>${t.side}</td>`
+      + `<td class='num'>${fmt(t.entry_price)}</td><td class='num'>${fmt(t.exit_price)}</td>`
+      + `<td class='num ${cls(t.pnl)}'>${(t.pnl>=0?"+":"")}${fmt(t.pnl)}</td><td>${t.exit_reason||""}</td></tr>`;
+  }
+  div.innerHTML = h + "</table>";
+}
+
+function renderEvents(d) {
+  const div = document.getElementById("events");
+  const rows = (d.events || []).slice().reverse();
+  if (rows.length === 0) { div.innerHTML = '<div class="empty">No events yet.</div>'; return; }
+  let h = "<table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>";
+  for (const e of rows) {
+    const when = (e.ts || "").replace("T", " ").slice(0, 19);
+    const detail = e.symbol
+      ? `${e.symbol} ${e.exit_reason || e.reason || ""} ${e.pnl !== undefined ? ("pnl=" + fmt(e.pnl)) : ""}`
+      : (e.message || e.reason || "");
+    h += `<tr><td>${when}</td><td>${e.event}</td><td>${detail}</td></tr>`;
+  }
+  div.innerHTML = h + "</table>";
+}
+
+function renderEquity(d) {
+  const pts = d.points || [];
+  const labels = pts.map(p => p.ts.replace("T", " ").slice(5, 16));
+  const data = pts.map(p => p.equity);
+  if (!chart) {
+    chart = new Chart(document.getElementById("equityChart"), {
+      type: "line",
+      data: { labels, datasets: [{
+        data, borderColor: "#58a6ff", backgroundColor: "rgba(88,166,255,.1)",
+        fill: true, tension: .25, pointRadius: 0, borderWidth: 2,
+      }]},
+      options: {
+        responsive: true, maintainAspectRatio: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: "#8b949e", maxTicksLimit: 8 }, grid: { color: "#21262d" } },
+          y: { ticks: { color: "#8b949e" }, grid: { color: "#21262d" } },
+        },
+      },
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update("none");
+  }
+}
+
+function renderBriefing(b) {
+  document.getElementById("briefing").textContent =
+    b.available ? b.briefing_text : "No briefing generated yet.";
+}
+
+async function refresh() {
+  try {
+    const [status, pnl, trades, events, equity, briefing] = await Promise.all([
+      getJSON("/api/status"), getJSON("/api/pnl?hours=24"),
+      getJSON("/api/trades?limit=20"), getJSON("/api/events?limit=30"),
+      getJSON("/api/equity"), getJSON("/api/briefing"),
+    ]);
+    renderStatus(status); renderPnl(pnl); renderTrades(trades);
+    renderEvents(events); renderEquity(equity); renderBriefing(briefing);
+    document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("updated").textContent = "error: " + e.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

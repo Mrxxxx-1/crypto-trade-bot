@@ -8,6 +8,7 @@ from __future__ import annotations
 from .bot import FuturesBot
 from .briefing import start_briefing_thread
 from .config import load_settings
+from .telegram_control import start_control_thread
 
 
 def main() -> None:
@@ -40,6 +41,19 @@ def main() -> None:
             print(
                 "DAILY_BRIEFING_ENABLED is set but TELEGRAM_BOT_TOKEN / "
                 "TELEGRAM_CHAT_ID / GEMINI_API_KEY are missing — skipping briefing."
+            )
+
+    if settings.telegram_control_enabled:
+        if settings.telegram_control_configured:
+            start_control_thread(settings)
+            print(
+                "Two-way Telegram control enabled — message the bot /help. "
+                "Agent can read stats and pause/resume only (never open/close)."
+            )
+        else:
+            print(
+                "TELEGRAM_CONTROL_ENABLED is set but TELEGRAM_BOT_TOKEN / "
+                "TELEGRAM_CHAT_ID are missing — skipping control listener."
             )
 
     bot = FuturesBot(settings)

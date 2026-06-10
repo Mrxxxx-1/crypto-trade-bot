@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict
 
+from . import control
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
 from .risk import RiskManager
@@ -41,9 +42,37 @@ class FuturesBot:
             self.broker = PaperBroker(settings, self.exchange)
         self.starting_equity = settings.initial_equity
         self.loop_count = 0
+        # Cross-process pause flag (toggled by the Telegram/MCP agent layer).
+        # Re-read once per loop in run_forever; only blocks NEW entries/adds.
+        self.paused = control.is_paused(settings.logs_dir)
 
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _positions_snapshot(self) -> list[dict]:
+        """Structured view of open positions for heartbeat logging.
+
+        Consumed by the dashboard / MCP / Telegram read layer so they always
+        report the bot's actual current positions (not parsed from text).
+        """
+        snap = []
+        for symbol, pos in self.broker.positions.items():
+            snap.append(
+                {
+                    "symbol": symbol,
+                    "side": pos.side,
+                    "legs": len(pos.legs),
+                    "max_legs": self.settings.max_dca_legs,
+                    "size": round(pos.size, 8),
+                    "avg_entry": round(pos.entry_price, 4),
+                    "last_fill": round(pos.last_fill_price, 4),
+                    "trail_armed": pos.trail_armed,
+                    "peak_price": round(pos.peak_price, 4),
+                    "stop_price": round(pos.stop_price, 4),
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+                }
+            )
+        return snap
 
     def _unrealized_pct(self, avg_entry: float, last_close: float) -> float:
         if avg_entry <= 0:
@@ -117,7 +146,7 @@ class FuturesBot:
             # if still open, consider DCA add
             if symbol in self.broker.positions:
                 pos = self.broker.positions[symbol]
-                if len(pos.legs) < self.settings.max_dca_legs:
+                if not self.paused and len(pos.legs) < self.settings.max_dca_legs:
                     if dca_trigger(last_close, pos.last_fill_price, self.settings):
                         if price_in_zone(symbol, last_close, self.settings):
                             if self.risk.can_trade(self.broker.equity):
@@ -149,6 +178,9 @@ class FuturesBot:
                 )
 
         # --- 2. No position: maybe open the first leg ---
+        if self.paused:
+            return f"{symbol} paused_no_entry last={last_close:.2f}"
+
         if not price_in_zone(symbol, last_close, self.settings):
             cap = self.settings.max_price_for(symbol)
             return f"{symbol} no_entry above_cap last={last_close:.2f} cap={cap:.2f}"
@@ -200,6 +232,20 @@ class FuturesBot:
         while True:
             try:
                 self.loop_count += 1
+                # Refresh the cross-process pause flag once per tick (cheap file read).
+                prev_paused = self.paused
+                self.paused = control.is_paused(self.settings.logs_dir)
+                if self.paused != prev_paused:
+                    ctrl = control.read_control(self.settings.logs_dir)
+                    print(
+                        f"[{self._utc_now()}] "
+                        f"{'PAUSED' if self.paused else 'RESUMED'} "
+                        f"by={ctrl.get('by') or '?'} reason={ctrl.get('reason') or '-'}"
+                    )
+                    self.broker.log_event(
+                        "trading_paused" if self.paused else "trading_resumed",
+                        {"by": ctrl.get("by", ""), "reason": ctrl.get("reason", "")},
+                    )
                 statuses = []
                 for symbol in self.settings.symbols:
                     statuses.append(self._process_symbol(symbol))
@@ -208,6 +254,7 @@ class FuturesBot:
                         f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
                         f"equity={self.broker.equity:.2f} "
                         f"open_positions={len(self.broker.positions)}"
+                        f"{' [PAUSED]' if self.paused else ''}"
                     )
                     for status in statuses:
                         print(f"  - {status}")
@@ -217,6 +264,8 @@ class FuturesBot:
                             "loop": self.loop_count,
                             "equity": self.broker.equity,
                             "open_positions": len(self.broker.positions),
+                            "paused": self.paused,
+                            "positions": self._positions_snapshot(),
                             "statuses": statuses,
                         },
                     )

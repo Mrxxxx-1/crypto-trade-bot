@@ -208,6 +208,86 @@ sudo tee /etc/logrotate.d/crypto-bot > /dev/null <<'EOF'
 EOF
 ```
 
+## 10b) Optional services: web dashboard + Telegram control
+
+These run as **separate systemd services** alongside `crypto-bot`, sharing the
+same `logs/` directory. Neither can place orders — the agent layer can only
+read stats and pause/resume.
+
+### Web dashboard (read-only monitoring UI)
+
+Open the dashboard port in the GCP firewall first (VPC network → Firewall →
+allow `tcp:8000` from your IP), then:
+
+```bash
+sudo tee /etc/systemd/system/crypto-dashboard.service > /dev/null <<'EOF'
+[Unit]
+Description=Crypto Bot Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mrx10210
+WorkingDirectory=/home/mrx10210/crypto-trade-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/mrx10210/crypto-trade-bot/.venv/bin/python -m src.webapp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo sed -i "s/mrx10210/$(whoami)/g" /etc/systemd/system/crypto-dashboard.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-dashboard
+```
+
+Then browse to `http://<VM_EXTERNAL_IP>:8000`. To avoid exposing it publicly,
+set `DASHBOARD_HOST=127.0.0.1` in `.env` and reach it via an SSH tunnel
+(`ssh -L 8000:localhost:8000 user@vm`) or put nginx + TLS in front.
+
+### Two-way Telegram control
+
+Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (Gemini optional,
+for natural-language commands). No inbound port needed — it uses long polling.
+
+```bash
+sudo tee /etc/systemd/system/crypto-telegram.service > /dev/null <<'EOF'
+[Unit]
+Description=Crypto Bot Telegram Control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mrx10210
+WorkingDirectory=/home/mrx10210/crypto-trade-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/mrx10210/crypto-trade-bot/.venv/bin/python -m src.telegram_control
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo sed -i "s/mrx10210/$(whoami)/g" /etc/systemd/system/crypto-telegram.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-telegram
+```
+
+> Alternatively, set `TELEGRAM_CONTROL_ENABLED=true` in `.env` to run the
+> listener inside the main `crypto-bot` process and skip this service.
+
+Message your bot `/help` to confirm it responds. Only messages from your
+`TELEGRAM_CHAT_ID` are honored.
+
+### MCP server
+
+The MCP server (`python -m src.mcp_server`) is launched on demand by an MCP
+client (Cursor / Claude Desktop) over stdio — it is **not** a long-running
+systemd service. See the README for an example client config.
+
 ## 11) Paper → Live transition checklist
 
 Before switching `MODE=live`:

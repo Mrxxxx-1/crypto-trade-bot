@@ -94,6 +94,50 @@ Optional: `GEMINI_MODEL` (default in code: `gemini-2.0-flash` if unset) override
 
 If the logs contain no trades or heartbeats for that window, the summary will reflect **empty data** — run the bot so `events.jsonl` receives heartbeats and completed trades appear in `trades.jsonl`.
 
+### 7. Web dashboard (optional)
+
+A read-only monitoring UI (FastAPI + Chart.js) that renders live equity, open positions, recent trades/events, pause state, and the latest briefing. It reads the same `logs/*.jsonl` the bot writes, so it runs as a **separate process**.
+
+```powershell
+python -m src.webapp
+```
+
+Then open `http://<host>:<DASHBOARD_PORT>` (default `8000`). Configure `DASHBOARD_HOST` / `DASHBOARD_PORT` in `.env`. The dashboard is **read-only** — it has no endpoint that can trade, pause, or change anything.
+
+### 8. Two-way Telegram control (optional, agentic)
+
+Turns the one-way briefing into an interactive control channel. You message the bot; it runs a **slash command** directly, or routes **free-text** through Gemini to the right tool.
+
+```powershell
+python -m src.telegram_control
+```
+
+Or set `TELEGRAM_CONTROL_ENABLED=true` to run it inside `python -m src.main`. Commands: `/status`, `/pnl [hours]`, `/trades [n]`, `/positions`, `/events [n]`, `/briefing`, `/pause [reason]`, `/resume`, `/help`. Only messages from your `TELEGRAM_CHAT_ID` are honored.
+
+> **Safety boundary:** the agent can read stats and **pause/resume** trading only. It can **never open, close, or modify a position**, and cannot switch to live mode. Pausing blocks *new* entries and DCA adds; open positions keep their trailing-stop protection. This is enforced by construction — the shared tool registry (`src/agent_tools.py`) contains no order-placement tool.
+
+### 9. MCP server (optional, agentic)
+
+Exposes the same read + pause/resume tools over the **Model Context Protocol**, so any MCP client (Cursor, Claude Desktop, a custom agent) can query and control the bot through a standard interface.
+
+```powershell
+python -m src.mcp_server
+```
+
+Example MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "crypto-bot": {
+      "command": "/path/to/.venv/bin/python",
+      "args": ["-m", "src.mcp_server"],
+      "cwd": "/path/to/crypto-trade-bot"
+    }
+  }
+}
+```
+
 ## Environment Variables
 
 All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for a complete template.
@@ -177,6 +221,16 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Model id if you need another Gemini model |
 | `DAILY_BRIEFING_HOUR_UTC` | `8` | UTC hour (0–23) for the in-process daily send |
 
+### Dashboard & agentic control
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DASHBOARD_HOST` | `0.0.0.0` | Bind address for the web dashboard (`127.0.0.1` for local-only) |
+| `DASHBOARD_PORT` | `8000` | Port for the web dashboard |
+| `TELEGRAM_CONTROL_ENABLED` | (off) | Set `true` to run the two-way Telegram listener inside `python -m src.main` |
+
+The Telegram control listener and MCP server reuse `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `GEMINI_API_KEY` from the briefing section above.
+
 ## Project Layout
 
 ```
@@ -191,11 +245,19 @@ src/
   backtest.py       Offline backtester on cached candle data
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
+  control.py        Cross-process pause/resume flag (logs/control.json)
+  agent_tools.py    Single registry of agent-callable tools (read + pause/resume only)
+  webapp.py         Read-only FastAPI dashboard (python -m src.webapp)
+  mcp_server.py     MCP server exposing the tool registry (python -m src.mcp_server)
+  telegram_control.py  Two-way Telegram control listener (python -m src.telegram_control)
+  static/
+    index.html      Dashboard single-page UI (Chart.js)
 logs/
   events.jsonl      Heartbeats, position opens/closes, errors
   trades.jsonl      Completed trade records with P&L
   briefings.jsonl   Full daily briefing history
   briefing_state.json  Last UTC date the in-process daily briefing was sent (optional)
+  control.json      Pause/resume state shared across processes (optional)
 data/
   *.json            Cached OHLCV candle data for backtesting
 ```
