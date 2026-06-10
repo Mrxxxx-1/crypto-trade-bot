@@ -18,6 +18,7 @@ Every tool takes a ``Settings`` first argument and returns a JSON-serializable
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -47,6 +48,22 @@ def _latest_event(path: Path, event_name: str) -> dict[str, Any] | None:
         if row.get("event") == event_name:
             latest = row
     return latest
+
+
+def _parse_iso(ts: str) -> datetime:
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.fromisoformat(ts).astimezone(timezone.utc)
+
+
+def _demo_reference_now(logs: Path) -> datetime | None:
+    """For committed ``demo_logs/``, anchor time windows to the latest heartbeat."""
+    if logs.name != "demo_logs":
+        return None
+    hb = _latest_event(logs / "events.jsonl", "heartbeat")
+    if not hb or not hb.get("ts"):
+        return None
+    return _parse_iso(str(hb["ts"]))
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +101,8 @@ def get_status(settings: Settings) -> dict[str, Any]:
 def get_pnl(settings: Settings, hours: int = 24) -> dict[str, Any]:
     """Aggregated P&L / risk stats over the trailing ``hours`` window."""
     hours = max(1, int(hours))
-    stats = collect_window(_logs_dir(settings), hours=hours)
+    logs = _logs_dir(settings)
+    stats = collect_window(logs, hours=hours, now=_demo_reference_now(logs))
     return {
         "window_hours": hours,
         "since_utc": stats.since.isoformat(),

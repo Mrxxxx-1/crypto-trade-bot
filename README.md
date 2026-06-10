@@ -104,6 +104,8 @@ python -m src.webapp
 
 Then open `http://<host>:<DASHBOARD_PORT>` (default `8000`). Configure `DASHBOARD_HOST` / `DASHBOARD_PORT` in `.env`. The dashboard is **read-only** — it has no endpoint that can trade, pause, or change anything.
 
+**Public demo (sample data, no real bot logs):** set `DASHBOARD_DEMO_MODE=true`. The dashboard then reads committed files under `demo_logs/` (fake trades, heartbeats, briefing) and shows a **DEMO** banner. Safe to expose on a public URL without leaking your real performance data. The trading bot does not need to be running on that VM.
+
 ### 8. Two-way Telegram control (optional, agentic)
 
 Turns the one-way briefing into an interactive control channel. You message the bot; it runs a **slash command** directly, or routes **free-text** through Gemini to the right tool.
@@ -227,6 +229,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 |----------|---------|-------------|
 | `DASHBOARD_HOST` | `0.0.0.0` | Bind address for the web dashboard (`127.0.0.1` for local-only) |
 | `DASHBOARD_PORT` | `8000` | Port for the web dashboard |
+| `DASHBOARD_DEMO_MODE` | (off) | Set `true` for a public demo using fake data from `demo_logs/` |
 | `TELEGRAM_CONTROL_ENABLED` | (off) | Set `true` to run the two-way Telegram listener inside `python -m src.main` |
 
 The Telegram control listener and MCP server reuse `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `GEMINI_API_KEY` from the briefing section above.
@@ -252,6 +255,9 @@ src/
   telegram_control.py  Two-way Telegram control listener (python -m src.telegram_control)
   static/
     index.html      Dashboard single-page UI (Chart.js)
+demo_logs/
+  *.jsonl           Sample trades/events/briefings for public dashboard demo
+  control.json      Sample pause state for demo mode
 logs/
   events.jsonl      Heartbeats, position opens/closes, errors
   trades.jsonl      Completed trade records with P&L

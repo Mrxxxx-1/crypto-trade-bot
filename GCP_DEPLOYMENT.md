@@ -216,8 +216,29 @@ read stats and pause/resume.
 
 ### Web dashboard (read-only monitoring UI)
 
+#### Option A — Public demo with **fake data** (recommended for reviewers)
+
+Use a **separate small VM** (or the same VM without running the real bot) so
+you can share a URL with anyone without exposing real trades or API keys.
+
+In `.env` on that VM:
+
+```bash
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8000
+DASHBOARD_DEMO_MODE=true
+```
+
+Do **not** copy your real `.env` with Telegram/Gemini/wallet secrets to this VM.
+`demo_logs/` in the repo supplies all dashboard data; the bot service is optional.
+
+Open GCP firewall `tcp:8000` to `0.0.0.0/0` (or your region), then install the
+dashboard service below. Visitors see a **DEMO** banner and sample paper stats.
+
+#### Option B — Live dashboard (your real bot logs)
+
 Open the dashboard port in the GCP firewall first (VPC network → Firewall →
-allow `tcp:8000` from your IP), then:
+allow `tcp:8000` from your IP), keep `DASHBOARD_DEMO_MODE=false`, then:
 
 ```bash
 sudo tee /etc/systemd/system/crypto-dashboard.service > /dev/null <<'EOF'

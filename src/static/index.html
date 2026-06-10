@@ -28,6 +28,11 @@
   .badge.paper { background: rgba(88,166,255,.15); color: var(--accent); }
   .badge.running { background: rgba(63,185,80,.15); color: var(--green); }
   .badge.paused { background: rgba(210,153,34,.15); color: var(--amber); }
+  .badge.demo { background: rgba(210,153,34,.15); color: var(--amber); }
+  .demo-banner {
+    background: rgba(210,153,34,.12); border-bottom: 1px solid rgba(210,153,34,.35);
+    color: #e3b341; padding: 10px 24px; font-size: 13px; text-align: center;
+  }
   .spacer { flex: 1; }
   #updated { color: var(--muted); font-size: 12px; }
   main { padding: 24px; max-width: 1200px; margin: 0 auto; }
@@ -57,8 +62,12 @@
 </style>
 </head>
 <body>
+<div id="demo-banner" class="demo-banner" style="display:none">
+  Public demo — sample paper-trading data only. Not connected to a live bot.
+</div>
 <header>
   <h1>Crypto Bot Dashboard</h1>
+  <span id="demo-badge" class="badge demo" style="display:none">DEMO</span>
   <span id="mode-badge" class="badge paper">…</span>
   <span id="state-badge" class="badge running">…</span>
   <div class="spacer"></div>
@@ -109,6 +118,12 @@ async function getJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) throw new Error(url + " -> " + r.status);
   return r.json();
+}
+
+function renderDemo(meta, status) {
+  const demo = !!(meta && meta.demo_mode) || !!(status && status.demo_mode);
+  document.getElementById("demo-banner").style.display = demo ? "block" : "none";
+  document.getElementById("demo-badge").style.display = demo ? "inline-block" : "none";
 }
 
 function renderStatus(s) {
@@ -217,11 +232,12 @@ function renderBriefing(b) {
 
 async function refresh() {
   try {
-    const [status, pnl, trades, events, equity, briefing] = await Promise.all([
-      getJSON("/api/status"), getJSON("/api/pnl?hours=24"),
+    const [meta, status, pnl, trades, events, equity, briefing] = await Promise.all([
+      getJSON("/api/meta"), getJSON("/api/status"), getJSON("/api/pnl?hours=24"),
       getJSON("/api/trades?limit=20"), getJSON("/api/events?limit=30"),
       getJSON("/api/equity"), getJSON("/api/briefing"),
     ]);
+    renderDemo(meta, status);
     renderStatus(status); renderPnl(pnl); renderTrades(trades);
     renderEvents(events); renderEquity(equity); renderBriefing(briefing);
     document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();

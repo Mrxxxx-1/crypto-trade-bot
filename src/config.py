@@ -118,6 +118,7 @@ class Settings:
     # Web dashboard + agentic control surfaces
     dashboard_host: str
     dashboard_port: int
+    dashboard_demo_mode: bool
     telegram_control_enabled: bool
 
     @property
@@ -218,6 +219,8 @@ def load_settings() -> Settings:
         ),
         dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0",
         dashboard_port=_as_int("DASHBOARD_PORT", 8000),
+        dashboard_demo_mode=os.getenv("DASHBOARD_DEMO_MODE", "").lower()
+        in ("1", "true", "yes"),
         telegram_control_enabled=os.getenv("TELEGRAM_CONTROL_ENABLED", "").lower()
         in ("1", "true", "yes"),
     )
