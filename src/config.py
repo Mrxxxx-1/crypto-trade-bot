@@ -62,6 +62,8 @@ class Settings:
     testnet: bool
 
     symbols: List[str]
+    short_symbols: List[str]           # base coins traded short-only (e.g. ["TRUMP", "HYPE"])
+    strategy: str                      # "dca" (dip-buying) or "trend" (EMA/ATR trend-following)
     timeframe: str
     poll_seconds: int
     lookback_candles: int
@@ -82,21 +84,30 @@ class Settings:
     max_dca_legs: int                  # hard cap on legs per symbol
     trail_activate_pct: float          # arm trailing once price >= avg_cost * (1 + this/100)
     trail_distance_pct: float          # once armed, exit if price <= peak * (1 - this/100)
+    stop_loss_pct: float               # hard stop: exit all legs if price <= avg_cost * (1 - this/100); 0 disables
+    take_profit_pct: float             # fixed TP: exit all legs if price >= avg_cost * (1 + this/100); 0 disables
+    trend_filter_enabled: bool         # only enter/add when price is above the long EMA (skip downtrends)
+    trend_ema_period: int              # EMA period for the trend filter
 
-    # --- Deprecated by DCA strategy; retained so old .env files don't crash ---
-    risk_per_trade_pct: float
-    fast_ema: int
-    slow_ema: int
-    atr_period: int
+    # --- Trend-following strategy parameters (STRATEGY=trend) ---
+    # EMA cross + 200-EMA regime filter, ATR initial stop, ATR chandelier trail,
+    # fixed-fractional (risk %) position sizing. trend_ema_period (above) is the
+    # regime EMA shared with the DCA trend filter.
+    risk_per_trade_pct: float          # % of equity risked per trade (stop distance = risk)
+    fast_ema: int                      # fast EMA for the trend cross
+    slow_ema: int                      # slow EMA for the trend cross
+    atr_period: int                    # ATR lookback for stops/sizing
+    stop_atr_multiplier: float         # initial stop distance = this * ATR
+    trail_atr_multiplier: float        # chandelier trail distance = this * ATR
+
+    # --- Deprecated knobs; retained so old .env files don't crash ---
     atr_min_pct: float
-    stop_atr_multiplier: float
     take_profit_r: float
     cooldown_candles: int
     post_stop_candles: int
     htf_timeframe: str
     stop_atr_source: str
     trail_after_r: float
-    trail_atr_multiplier: float
     volume_min_mult: float
 
     consec_halt_hours: float
@@ -147,6 +158,15 @@ class Settings:
         base = symbol.split("/")[0].strip().upper() if "/" in symbol else symbol.strip().upper()
         return self.long_max_prices.get(base, float("inf"))
 
+    def direction_for(self, symbol: str) -> str:
+        """Return ``"short"`` if the symbol's base is in ``short_symbols``, else ``"long"``.
+
+        The strategy is long-only by default; only symbols explicitly listed in
+        ``SHORT_SYMBOLS`` are traded short (mirror logic).
+        """
+        base = symbol.split("/")[0].strip().upper() if "/" in symbol else symbol.strip().upper()
+        return "short" if base in self.short_symbols else "long"
+
 
 def load_settings() -> Settings:
     """Load ``.env``, parse every variable with its documented default, return Settings."""
@@ -157,6 +177,11 @@ def load_settings() -> Settings:
         for s in os.getenv("SYMBOLS", "BTC/USDC:USDC,ETH/USDC:USDC").split(",")
         if s.strip()
     ]
+    short_symbols = [
+        s.strip().upper()
+        for s in os.getenv("SHORT_SYMBOLS", "").split(",")
+        if s.strip()
+    ]
 
     return Settings(
         mode=os.getenv("MODE", "paper"),
@@ -164,6 +189,8 @@ def load_settings() -> Settings:
         private_key=os.getenv("HL_PRIVATE_KEY", "").strip(),
         testnet=os.getenv("HL_TESTNET", "").lower() in ("1", "true", "yes"),
         symbols=symbols,
+        short_symbols=short_symbols,
+        strategy=os.getenv("STRATEGY", "dca").strip().lower() or "dca",
         timeframe=os.getenv("TIMEFRAME", "15m"),
         poll_seconds=_as_int("POLL_SECONDS", 30),
         lookback_candles=_as_int("LOOKBACK_CANDLES", 200),
@@ -184,6 +211,11 @@ def load_settings() -> Settings:
         max_dca_legs=_as_int("MAX_DCA_LEGS", 5),
         trail_activate_pct=_as_float("TRAIL_ACTIVATE_PCT", 5.0),
         trail_distance_pct=_as_float("TRAIL_DISTANCE_PCT", 3.0),
+        stop_loss_pct=_as_float("STOP_LOSS_PCT", 0.0),
+        take_profit_pct=_as_float("TAKE_PROFIT_PCT", 0.0),
+        trend_filter_enabled=os.getenv("TREND_FILTER_ENABLED", "true").lower()
+        in ("1", "true", "yes"),
+        trend_ema_period=_as_int("TREND_EMA_PERIOD", 200),
 
         # Deprecated knobs (kept for back-compat with old .env files)
         risk_per_trade_pct=_as_float("RISK_PER_TRADE_PCT", 0.5),

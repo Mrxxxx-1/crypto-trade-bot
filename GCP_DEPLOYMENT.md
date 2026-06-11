@@ -264,7 +264,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now crypto-dashboard
 ```
 
-Then browse to `http://<VM_EXTERNAL_IP>:8000`. To avoid exposing it publicly,
+Then browse to `http://35.200.32.57:8000`. To avoid exposing it publicly,
 set `DASHBOARD_HOST=127.0.0.1` in `.env` and reach it via an SSH tunnel
 (`ssh -L 8000:localhost:8000 user@vm`) or put nginx + TLS in front.
 

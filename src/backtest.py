@@ -28,9 +28,20 @@ from .config import Settings, load_settings
 from .strategy import (
     dca_trigger,
     entry_trigger,
+    in_trend,
     price_in_zone,
     should_arm_trail,
+    stop_loss_price,
+    take_profit_price,
     trail_stop_price,
+)
+from .strategy_trend import (
+    atr_value,
+    chandelier_stop,
+    initial_stop,
+    position_size,
+    regime_intact,
+    trend_signal,
 )
 
 
@@ -163,6 +174,48 @@ def _recompute(pos: BTPosition) -> None:
     pos.entry_price = sum(l.size * l.entry_price for l in pos.legs) / total
 
 
+def _close_bt_position(
+    positions: Dict[str, BTPosition],
+    trades: List["BTTrade"],
+    symbol: str,
+    pos: BTPosition,
+    exit_at: float,
+    reason: str,
+    settings: Settings,
+    candle_ts,
+) -> float:
+    """Close all legs at ``exit_at``, record the trade, and return realized net P&L.
+
+    Direction-aware: a short (``side == "sell"``) profits when the exit price is
+    below the average entry, so its raw P&L is negated.
+    """
+    exit_side = "sell" if pos.side == "buy" else "buy"
+    exit_px = _exec_price(exit_at, exit_side, settings.slippage_bps)
+    total_size = pos.size
+    exit_fee = _fee(exit_px * total_size, settings.exit_fee_bps)
+    raw_pnl = (exit_px - pos.entry_price) * total_size
+    if pos.side == "sell":
+        raw_pnl = -raw_pnl
+    net_pnl = raw_pnl - exit_fee
+    trades.append(
+        BTTrade(
+            symbol=symbol,
+            side=pos.side,
+            size=total_size,
+            entry_price=pos.entry_price,
+            exit_price=exit_px,
+            pnl=net_pnl,
+            fees=exit_fee + sum(l.fee for l in pos.legs),
+            opened_at=pos.opened_at,
+            closed_at=candle_ts,
+            exit_reason=reason,
+            legs=len(pos.legs),
+        )
+    )
+    del positions[symbol]
+    return net_pnl
+
+
 # ---------------------------------------------------------------------------
 # Core engine
 # ---------------------------------------------------------------------------
@@ -206,7 +259,87 @@ def run_backtest(
             low = float(candle[3])
             close = float(candle[4])
 
-            # --- 1. Manage open position (trail / exit / DCA) ---
+            direction = settings.direction_for(symbol)
+            is_long = direction != "short"
+            side = "buy" if is_long else "sell"
+
+            # ===== Trend-following strategy path =====
+            if settings.strategy == "trend":
+                closed_window = candles_by_symbol[symbol][i - lookback : i]
+                atr = atr_value(closed_window, settings)
+
+                if symbol in positions:
+                    pos = positions[symbol]
+                    first_leg_candle = pos.legs[0].entry_candle if pos.legs else i
+                    allow_exit = i > first_leg_candle
+
+                    if is_long:
+                        pos.peak_price = max(pos.peak_price, high)
+                    else:
+                        pos.peak_price = min(pos.peak_price, low)
+                    chand = chandelier_stop(pos.peak_price, atr, settings, direction)
+                    if chand > 0:
+                        if is_long:
+                            pos.stop_price = max(pos.stop_price, chand)
+                        else:
+                            pos.stop_price = chand if pos.stop_price <= 0 else min(pos.stop_price, chand)
+
+                    stop_hit = pos.stop_price > 0 and (
+                        low <= pos.stop_price if is_long else high >= pos.stop_price
+                    )
+                    if allow_exit and stop_hit:
+                        net_pnl = _close_bt_position(
+                            positions, trades, symbol, pos, pos.stop_price, "trail", settings, candle_ts
+                        )
+                        equity += net_pnl
+                        risk.on_trade_close(candle_ts, net_pnl, equity)
+                        continue
+
+                    if allow_exit and not regime_intact(closed_window, settings, direction):
+                        net_pnl = _close_bt_position(
+                            positions, trades, symbol, pos, close, "regime", settings, candle_ts
+                        )
+                        equity += net_pnl
+                        risk.on_trade_close(candle_ts, net_pnl, equity)
+                    continue
+
+                # No position: enter on a fresh trend signal
+                if atr <= 0:
+                    continue
+                if not trend_signal(closed_window, settings, direction):
+                    continue
+                if not risk.can_trade(candle_ts, equity):
+                    continue
+                init_stop = initial_stop(close, atr, settings, direction)
+                size = position_size(equity, close, init_stop, settings)
+                if size <= 0:
+                    continue
+                entry_px = _exec_price(close, side, settings.slippage_bps)
+                entry_fee = _fee(entry_px * size, settings.entry_fee_bps)
+                equity -= entry_fee
+                positions[symbol] = BTPosition(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    entry_price=entry_px,
+                    opened_at=candle_ts,
+                    entry_candle=i,
+                    last_fill_price=entry_px,
+                    peak_price=entry_px,
+                    stop_price=init_stop,
+                    legs=[
+                        BTLeg(
+                            size=size,
+                            entry_price=entry_px,
+                            opened_at=candle_ts,
+                            entry_candle=i,
+                            fee=entry_fee,
+                        )
+                    ],
+                )
+                continue
+
+            # --- 1. Manage open position (TP / trail / stop / DCA) ---
             if symbol in positions:
                 pos = positions[symbol]
 
@@ -215,58 +348,67 @@ def run_backtest(
                 first_leg_candle = pos.legs[0].entry_candle if pos.legs else i
                 allow_exit = i > first_leg_candle
 
-                # Arm trail if threshold reached (uses close, like the live bot)
-                if not pos.trail_armed and should_arm_trail(pos.entry_price, close, settings):
+                # Fixed take-profit: exit all legs once the bar reaches the target.
+                tp_price = take_profit_price(pos.entry_price, settings, direction)
+                tp_hit = tp_price > 0 and (high >= tp_price if is_long else low <= tp_price)
+                if allow_exit and tp_hit:
+                    net_pnl = _close_bt_position(
+                        positions, trades, symbol, pos, tp_price, "tp", settings, candle_ts
+                    )
+                    equity += net_pnl
+                    risk.on_trade_close(candle_ts, net_pnl, equity)
+                    continue
+
+                # Arm trail once price has moved favorably by trail_activate_pct.
+                if not pos.trail_armed and should_arm_trail(pos.entry_price, close, settings, direction):
                     pos.trail_armed = True
-                    pos.peak_price = max(pos.peak_price, high, close)
-                    pos.stop_price = trail_stop_price(pos.peak_price, settings)
+                    pos.peak_price = (
+                        max(pos.peak_price, high, close)
+                        if is_long
+                        else min(pos.peak_price, low, close)
+                    )
+                    pos.stop_price = trail_stop_price(pos.peak_price, settings, direction)
 
                 if pos.trail_armed:
-                    if high > pos.peak_price:
+                    if is_long and high > pos.peak_price:
                         pos.peak_price = high
-                        pos.stop_price = trail_stop_price(pos.peak_price, settings)
+                        pos.stop_price = trail_stop_price(pos.peak_price, settings, direction)
+                    elif not is_long and low < pos.peak_price:
+                        pos.peak_price = low
+                        pos.stop_price = trail_stop_price(pos.peak_price, settings, direction)
 
-                    if allow_exit and low <= pos.stop_price:
-                        exit_at = pos.stop_price
-                        exit_side = "sell" if pos.side == "buy" else "buy"
-                        exit_px = _exec_price(exit_at, exit_side, settings.slippage_bps)
-                        total_size = pos.size
-                        exit_fee = _fee(exit_px * total_size, settings.exit_fee_bps)
-
-                        raw_pnl = (exit_px - pos.entry_price) * total_size
-                        if pos.side == "sell":
-                            raw_pnl = -raw_pnl
-                        net_pnl = raw_pnl - exit_fee
-                        equity += net_pnl
-
-                        trades.append(
-                            BTTrade(
-                                symbol=symbol,
-                                side=pos.side,
-                                size=total_size,
-                                entry_price=pos.entry_price,
-                                exit_price=exit_px,
-                                pnl=net_pnl,
-                                fees=exit_fee + sum(l.fee for l in pos.legs),
-                                opened_at=pos.opened_at,
-                                closed_at=candle_ts,
-                                exit_reason="trail",
-                                legs=len(pos.legs),
-                            )
+                    trail_hit = low <= pos.stop_price if is_long else high >= pos.stop_price
+                    if allow_exit and trail_hit:
+                        net_pnl = _close_bt_position(
+                            positions, trades, symbol, pos, pos.stop_price, "trail", settings, candle_ts
                         )
-                        del positions[symbol]
+                        equity += net_pnl
                         risk.on_trade_close(candle_ts, net_pnl, equity)
-                        continue  # position closed, nothing else this bar
+                        continue
 
-                # Maybe add a DCA leg
+                # Hard stop-loss: cap catastrophic adverse moves (checked when not
+                # exited by trail). Exits all legs at the stop price.
+                sl_price = stop_loss_price(pos.entry_price, settings, direction)
+                sl_hit = sl_price > 0 and (low <= sl_price if is_long else high >= sl_price)
+                if allow_exit and sl_hit:
+                    net_pnl = _close_bt_position(
+                        positions, trades, symbol, pos, sl_price, "stop", settings, candle_ts
+                    )
+                    equity += net_pnl
+                    risk.on_trade_close(candle_ts, net_pnl, equity)
+                    continue
+
+                # Maybe add a DCA leg (further in the adverse direction)
                 if symbol in positions:
                     pos = positions[symbol]
                     if len(pos.legs) < settings.max_dca_legs:
-                        if dca_trigger(close, pos.last_fill_price, settings):
-                            if price_in_zone(symbol, close, settings) and risk.can_trade(candle_ts, equity):
+                        window = candles_by_symbol[symbol][i - lookback : i + 1]
+                        closed_window = window[:-1]
+                        if dca_trigger(close, pos.last_fill_price, settings, direction) and in_trend(closed_window, settings, direction):
+                            if price_in_zone(symbol, close, settings, direction) and risk.can_trade(candle_ts, equity):
                                 add_size = risk.calc_leg_size(starting_equity, close)
                                 if add_size > 0:
-                                    entry_px = _exec_price(close, "buy", settings.slippage_bps)
+                                    entry_px = _exec_price(close, side, settings.slippage_bps)
                                     entry_fee = _fee(entry_px * add_size, settings.entry_fee_bps)
                                     equity -= entry_fee
                                     pos.legs.append(
@@ -288,9 +430,11 @@ def run_backtest(
             window = candles_by_symbol[symbol][i - lookback : i + 1]
             closed_window = window[:-1]  # exclude the bar we're acting on, mirror bot.py
 
-            if not price_in_zone(symbol, close, settings):
+            if not price_in_zone(symbol, close, settings, direction):
                 continue
-            if not entry_trigger(closed_window, settings):
+            if not entry_trigger(closed_window, settings, direction):
+                continue
+            if not in_trend(closed_window, settings, direction):
                 continue
             if not risk.can_trade(candle_ts, equity):
                 continue
@@ -299,13 +443,13 @@ def run_backtest(
             if leg_size <= 0:
                 continue
 
-            entry_px = _exec_price(close, "buy", settings.slippage_bps)
+            entry_px = _exec_price(close, side, settings.slippage_bps)
             entry_fee = _fee(entry_px * leg_size, settings.entry_fee_bps)
             equity -= entry_fee
 
             positions[symbol] = BTPosition(
                 symbol=symbol,
-                side="buy",
+                side=side,
                 size=leg_size,
                 entry_price=entry_px,
                 opened_at=candle_ts,
@@ -427,17 +571,19 @@ def print_report(result: BTResult, label: str = "BACKTEST") -> None:
 _SETTINGS_FLOATS = {
     "INITIAL_EQUITY", "MAX_LEVERAGE", "MAX_DAILY_LOSS_PCT",
     "INITIAL_DIP_PCT", "DCA_TRIGGER_PCT", "LEG_NOTIONAL_PCT",
-    "TRAIL_ACTIVATE_PCT", "TRAIL_DISTANCE_PCT",
+    "TRAIL_ACTIVATE_PCT", "TRAIL_DISTANCE_PCT", "STOP_LOSS_PCT", "TAKE_PROFIT_PCT",
     "ENTRY_FEE_BPS", "EXIT_FEE_BPS", "SLIPPAGE_BPS",
     "CONSEC_HALT_HOURS", "DAILY_LOSS_HALT_HOURS",
+    "RISK_PER_TRADE_PCT", "STOP_ATR_MULTIPLIER", "TRAIL_ATR_MULTIPLIER",
 }
 _SETTINGS_INTS = {
     "POLL_SECONDS", "LOOKBACK_CANDLES", "MAX_CONSECUTIVE_LOSSES",
     "HIGH_LOOKBACK_CANDLES", "DIP_MEMORY_BARS", "MAX_DCA_LEGS",
-    "HEARTBEAT_INTERVAL", "LIMIT_TIMEOUT_SECONDS",
+    "HEARTBEAT_INTERVAL", "LIMIT_TIMEOUT_SECONDS", "TREND_EMA_PERIOD",
+    "FAST_EMA", "SLOW_EMA", "ATR_PERIOD",
 }
 _SETTINGS_BOOLS = {
-    "REQUIRE_GREEN_CONFIRMATION",
+    "REQUIRE_GREEN_CONFIRMATION", "TREND_FILTER_ENABLED",
 }
 
 
