@@ -79,10 +79,48 @@ Set in `.env`:
 Set in `.env`:
 
 - `MODE=live`
-- `HL_WALLET_ADDRESS=0x…` — your EVM wallet address
-- `HL_PRIVATE_KEY=…` — hex private key for that wallet (**keep this file secure**)
-- `HL_TESTNET=false` (set `true` to test on Hyperliquid testnet first)
-- Review `MAX_LEVERAGE`, `RISK_PER_TRADE_PCT`, `INITIAL_EQUITY` — these directly affect real money
+- `HL_TESTNET=true` to trade on Hyperliquid **testnet** first (fake funds), `false` for mainnet
+- Review `MAX_LEVERAGE`, `RISK_PER_TRADE_PCT` — these directly affect real money
+
+#### Credentials: direct wallet vs API (agent) wallet
+
+The bot signs with `HL_PRIVATE_KEY` and queries balances/positions under
+`HL_WALLET_ADDRESS`. There are two valid setups:
+
+- **Direct wallet** — `HL_PRIVATE_KEY` is your wallet's key and
+  `HL_WALLET_ADDRESS` is that same wallet's address.
+- **API / agent wallet (recommended)** — generate an API wallet in the
+  Hyperliquid UI (it can trade but **cannot withdraw**). Then:
+  - `HL_PRIVATE_KEY` = the **API wallet's** private key
+  - `HL_WALLET_ADDRESS` = your **main account** address (the funded one)
+
+  The adapter detects that the key's address differs from `HL_WALLET_ADDRESS`
+  and signs as the agent on behalf of the main account. Funds and positions
+  are read from the main account.
+
+#### Funding (unified account)
+
+`fetch_balance()` returns your **total USDC equity = perps account value + spot
+USDC**, so a **unified account** (USDC held in spot, used as perp collateral) is
+fully supported — you do **not** need to manually move USDC into the perps
+wallet. If your account is *not* unified and USDC sits unusable in spot, transfer
+it to perps (UI, or the SDK's `usd_class_transfer`) or the bot will size to 0.
+
+#### Strategy & direction
+
+- `STRATEGY=trend` (EMA/ATR trend-follower, recommended on `TIMEFRAME=4h`) or `dca`
+- `SHORT_SYMBOLS=` controls direction per symbol: bases listed here trade
+  **short-only** (mirror logic), everything else is **long-only**. A long-only
+  bot stays flat in a downtrend; add symbols here to trade the short side.
+- Opt-in entry filters (off by default): `ADX_MIN` (chop filter, trend),
+  `VOLUME_MIN_MULT` (volume confirmation), `MTF_ENABLED` (higher-timeframe
+  alignment), `DCA_CHANDELIER_ENABLED`. See the README "Entry-quality filters"
+  table for details.
+
+> **Startup reconciliation:** on launch the live bot adopts any open positions
+> already on the account and manages them with the active strategy — including
+> **closing** a position that no longer fits (e.g. a long when the trend has
+> flipped). Don't hand-trade the same account while the bot runs.
 
 **Security:**
 
@@ -107,10 +145,23 @@ Before running the bot, confirm the VM can reach Hyperliquid:
 
 ```bash
 source .venv/bin/activate
+# Mainnet:
 python -c "from hyperliquid.info import Info; from hyperliquid.utils import constants as c; i=Info(c.MAINNET_API_URL, skip_ws=True); print('BTC mid:', i.all_mids()['BTC'])"
+# Testnet (if HL_TESTNET=true):
+python -c "from hyperliquid.info import Info; from hyperliquid.utils import constants as c; i=Info(c.TESTNET_API_URL, skip_ws=True); print('BTC mid:', i.all_mids()['BTC'])"
 ```
 
 If this prints a price, the VM region is not geo-blocked. If it errors with a connection/403, try a different non-US region.
+
+**Credentials preflight (live mode):** confirm the bot resolves your account and
+sees your balance before starting the service — this places **no orders**:
+
+```bash
+python -c "from src.config import load_settings; from src.exchange import ExchangeAdapter; s=load_settings(); a=ExchangeAdapter(s); print('mode',s.mode,'testnet',s.testnet); print('account',s.wallet_address); print('balance',a.fetch_balance()); print('positions',a.fetch_positions())"
+```
+
+A non-zero `balance` (your total unified USDC) means credentials and funding are
+correct. `0.0` means wrong account address or an unfunded account.
 
 ## 7) Smoke test manually
 
@@ -122,7 +173,8 @@ python -m src.main
 
 Expected:
 
-- Startup line showing mode (paper or live), symbols, leverage cap
+- Startup line showing mode (paper or live), symbols, **strategy + timeframe**, and the active filters
+- In live mode, a `[reconcile] adopted open …` line for any position already on the account (or nothing if flat)
 - Periodic heartbeat lines
 - `logs/events.jsonl` keeps growing
 
@@ -313,18 +365,26 @@ systemd service. See the README for an example client config.
 
 Before switching `MODE=live`:
 
-1. Run paper mode for at least 1 week — verify:
+1. (Optional) Validate on **testnet** first: `HL_TESTNET=true` with an API wallet
+   and faucet USDC — same code path as mainnet, zero financial risk.
+2. Run paper mode for at least 1 week — verify:
    - no crashes or restart loops
    - open/close events appear correctly in logs
    - risk halts fire as expected
    - drawdown and consistency are within your plan
-2. Fund your Hyperliquid wallet with USDC (deposit via Arbitrum bridge)
-3. Set `INITIAL_EQUITY` to match your actual deposited balance
-4. Start with **conservative** settings: low `RISK_PER_TRADE_PCT` (e.g. 0.3), low `MAX_LEVERAGE` (e.g. 2)
-5. Update `.env`: `MODE=live`, add `HL_WALLET_ADDRESS` + `HL_PRIVATE_KEY`
-6. `chmod 600 .env` (restrict access)
-7. Restart: `sudo systemctl restart crypto-bot`
-8. Monitor the first few trades closely via `journalctl -u crypto-bot -f` and Telegram briefing
+3. Fund your Hyperliquid wallet with USDC (deposit via Arbitrum bridge). A
+   **unified account** can hold the USDC in spot — the bot reads the combined
+   balance. Confirm with the credentials preflight in step 6.
+4. `RISK_PER_TRADE_PCT` sizes off live equity, so `INITIAL_EQUITY` is only the
+   paper-mode starting balance; live equity is read from the exchange.
+5. Start with **conservative** settings: low `RISK_PER_TRADE_PCT` (e.g. 0.3), low
+   `MAX_LEVERAGE` (e.g. 2). Consider enabling `ADX_MIN=25` to skip choppy entries.
+6. Update `.env`: `MODE=live`, set `HL_WALLET_ADDRESS` (main account) +
+   `HL_PRIVATE_KEY` (wallet or API-wallet key), and confirm direction via
+   `SHORT_SYMBOLS`.
+7. `chmod 600 .env` (restrict access)
+8. Restart: `sudo systemctl restart crypto-bot`
+9. Monitor the first few trades closely via `journalctl -u crypto-bot -f` and Telegram briefing
 
 ## 12) Clean re-clone + start newest version
 
@@ -402,3 +462,7 @@ sudo systemctl restart crypto-bot
 - **Missing Python packages:** activate venv and rerun `pip install -r requirements.txt`.
 - **Bot appears idle:** if signals stay `flat`, this can be normal; adjust test profile when validating open/close flow.
 - **Live order errors:** check `logs/events.jsonl` for `order_error` or `close_error` events. Verify wallet has USDC balance and private key is correct.
+- **Bot won't open positions / `balance=0.0`:** run the credentials preflight (step 6). Either `HL_WALLET_ADDRESS` is the wrong account (must be the **main** account, not the API-wallet address) or the account is unfunded. With a non-unified account, move USDC from spot into perps.
+- **Bot closed a position I opened by hand:** expected — on startup the live bot reconciles and manages every open position, and closes any that don't fit the active strategy (look for `position_reconciled` then a `regime`/`trail` exit). Don't hand-trade the bot's account.
+- **Long-only bot does nothing in a downtrend:** also expected. Add the symbol's base to `SHORT_SYMBOLS` to trade the short side, or wait for an uptrend.
+- **Trend entries skipped with `adx_chop`:** the `ADX_MIN` filter is suppressing weak-trend entries; lower `ADX_MIN` (or set 0) if you want more trades.
