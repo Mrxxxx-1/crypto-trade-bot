@@ -100,6 +100,16 @@ class Settings:
     stop_atr_multiplier: float         # initial stop distance = this * ATR
     trail_atr_multiplier: float        # chandelier trail distance = this * ATR
 
+    # --- Entry-quality filters (opt-in; defaults keep them disabled) ---
+    adx_period: int                    # ADX lookback (Wilder)
+    adx_min: float                     # min ADX to allow trend entries; 0 disables the chop filter
+    volume_ma_period: int              # SMA window for the volume baseline
+    volume_min_mult: float             # entry bar volume must exceed this * volume MA; 0 disables
+    mtf_enabled: bool                  # require higher-timeframe trend alignment for entries
+    mtf_timeframe: str                 # higher timeframe (e.g. "4h") for the MTF filter
+    mtf_ema_period: int                # EMA period on the higher timeframe
+    dca_chandelier_enabled: bool       # use an ATR chandelier trail for the DCA exit instead of % trail
+
     # --- Deprecated knobs; retained so old .env files don't crash ---
     atr_min_pct: float
     take_profit_r: float
@@ -108,7 +118,6 @@ class Settings:
     htf_timeframe: str
     stop_atr_source: str
     trail_after_r: float
-    volume_min_mult: float
 
     consec_halt_hours: float
     daily_loss_halt_hours: float
@@ -224,14 +233,26 @@ def load_settings() -> Settings:
         atr_period=_as_int("ATR_PERIOD", 14),
         atr_min_pct=_as_float("ATR_MIN_PCT", 0.15),
         stop_atr_multiplier=_as_float("STOP_ATR_MULTIPLIER", 2.5),
+        trail_atr_multiplier=_as_float("TRAIL_ATR_MULTIPLIER", 2.0),
+
+        # Entry-quality filters (opt-in; defaults below leave them disabled)
+        adx_period=_as_int("ADX_PERIOD", 14),
+        adx_min=_as_float("ADX_MIN", 0.0),
+        volume_ma_period=_as_int("VOLUME_MA_PERIOD", 20),
+        volume_min_mult=_as_float("VOLUME_MIN_MULT", 0.0),
+        mtf_enabled=os.getenv("MTF_ENABLED", "").lower() in ("1", "true", "yes"),
+        mtf_timeframe=os.getenv("MTF_TIMEFRAME", "4h").strip() or "4h",
+        mtf_ema_period=_as_int("MTF_EMA_PERIOD", 50),
+        dca_chandelier_enabled=os.getenv("DCA_CHANDELIER_ENABLED", "").lower()
+        in ("1", "true", "yes"),
+
+        # Deprecated knobs (kept for back-compat with old .env files)
         take_profit_r=_as_float("TAKE_PROFIT_R", 2.0),
         cooldown_candles=_as_int("COOLDOWN_CANDLES", 0),
         post_stop_candles=_as_int("POST_STOP_CANDLES", 1),
         htf_timeframe=os.getenv("HTF_TIMEFRAME", "1h"),
         stop_atr_source=os.getenv("STOP_ATR_SOURCE", "htf"),
         trail_after_r=_as_float("TRAIL_AFTER_R", 0.0),
-        trail_atr_multiplier=_as_float("TRAIL_ATR_MULTIPLIER", 2.0),
-        volume_min_mult=_as_float("VOLUME_MIN_MULT", 0.0),
 
         consec_halt_hours=_as_float("CONSEC_HALT_HOURS", 6),
         daily_loss_halt_hours=_as_float("DAILY_LOSS_HALT_HOURS", 12),

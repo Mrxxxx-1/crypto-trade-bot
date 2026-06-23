@@ -20,8 +20,10 @@ from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
 from .risk import RiskManager
 from .strategy import (
+    adx_ok,
     dca_trigger,
     entry_trigger,
+    htf_trend_ok,
     in_trend,
     local_extreme,
     price_in_zone,
@@ -29,6 +31,7 @@ from .strategy import (
     stop_loss_price,
     take_profit_price,
     trail_stop_price,
+    volume_ok,
 )
 from .strategy_trend import (
     atr_value,
@@ -90,6 +93,17 @@ class FuturesBot:
             return 0.0
         return (last_close / avg_entry - 1.0) * 100.0
 
+    def _htf_closed(self, symbol: str) -> list:
+        """Closed higher-timeframe candles for the MTF filter ([] when disabled)."""
+        if not self.settings.mtf_enabled:
+            return []
+        htf = self.exchange.fetch_ohlcv(
+            symbol,
+            self.settings.mtf_timeframe,
+            self.settings.lookback_candles + 1,
+        )
+        return htf[:-1] if len(htf) >= 2 else htf
+
     def _process_symbol(self, symbol: str) -> str:
         """Process one symbol per tick.
 
@@ -120,6 +134,14 @@ class FuturesBot:
         is_long = direction != "short"
         side = "buy" if is_long else "sell"
 
+        # Optional ATR chandelier trail for DCA exits (else percent trail).
+        dca_atr = atr_value(closed_candles, self.settings) if self.settings.dca_chandelier_enabled else 0.0
+
+        def _dca_trail_stop(extreme: float) -> float:
+            if self.settings.dca_chandelier_enabled and dca_atr > 0:
+                return chandelier_stop(extreme, dca_atr, self.settings, direction)
+            return trail_stop_price(extreme, self.settings, direction)
+
         # --- 1. Manage open position (TP / trail / stop / DCA) ---
         if symbol in self.broker.positions:
             pos = self.broker.positions[symbol]
@@ -146,7 +168,7 @@ class FuturesBot:
                     if is_long
                     else min(pos.peak_price, current_low, last_close)
                 )
-                pos.stop_price = trail_stop_price(pos.peak_price, self.settings, direction)
+                pos.stop_price = _dca_trail_stop(pos.peak_price)
                 self.broker.log_event(
                     "trail_armed",
                     {
@@ -167,10 +189,10 @@ class FuturesBot:
                 # Ratchet the favorable extreme, then exit if price reverses to the stop.
                 if is_long and current_high > pos.peak_price:
                     pos.peak_price = current_high
-                    pos.stop_price = trail_stop_price(pos.peak_price, self.settings, direction)
+                    pos.stop_price = _dca_trail_stop(pos.peak_price)
                 elif not is_long and current_low < pos.peak_price:
                     pos.peak_price = current_low
-                    pos.stop_price = trail_stop_price(pos.peak_price, self.settings, direction)
+                    pos.stop_price = _dca_trail_stop(pos.peak_price)
                 trail_hit = current_low <= pos.stop_price if is_long else current_high >= pos.stop_price
                 if trail_hit:
                     trade = self.broker.close_all_legs(symbol, pos.stop_price, "trail")
@@ -250,6 +272,12 @@ class FuturesBot:
 
         if not in_trend(closed_candles, self.settings, direction):
             return f"{symbol} no_entry({direction}) trend_filter last={last_close:.4f}"
+
+        if not volume_ok(closed_candles, self.settings):
+            return f"{symbol} no_entry({direction}) low_volume last={last_close:.4f}"
+
+        if not htf_trend_ok(self._htf_closed(symbol), self.settings, direction):
+            return f"{symbol} no_entry({direction}) htf_misaligned last={last_close:.4f}"
 
         if not self.risk.can_trade(self.broker.equity):
             print(f"[{self._utc_now()}] HALT risk guard active, no new trades {symbol}")
@@ -355,6 +383,12 @@ class FuturesBot:
             return f"{symbol} no_entry no_atr last={last_close:.4f}"
         if not trend_signal(closed_candles, self.settings, direction):
             return f"{symbol} no_entry({direction}) no_trend last={last_close:.4f}"
+        if not adx_ok(closed_candles, self.settings):
+            return f"{symbol} no_entry({direction}) adx_chop last={last_close:.4f}"
+        if not volume_ok(closed_candles, self.settings):
+            return f"{symbol} no_entry({direction}) low_volume last={last_close:.4f}"
+        if not htf_trend_ok(self._htf_closed(symbol), self.settings, direction):
+            return f"{symbol} no_entry({direction}) htf_misaligned last={last_close:.4f}"
         if not self.risk.can_trade(self.broker.equity):
             print(f"[{self._utc_now()}] HALT risk guard active, no new trades {symbol}")
             return f"{symbol} blocked_by_risk last={last_close:.4f}"
@@ -381,17 +415,29 @@ class FuturesBot:
         """Main loop: process all symbols, sleep, log heartbeats."""
         print(
             f"[{self._utc_now()}] Start bot mode={self.settings.mode} "
-            f"symbols={self.settings.symbols} strategy=dca-on-dips"
+            f"symbols={self.settings.symbols} strategy={self.settings.strategy} "
+            f"timeframe={self.settings.timeframe}"
         )
-        print(
-            f"  caps: {self.settings.long_max_prices} "
-            f"initial_dip={self.settings.initial_dip_pct}% "
-            f"dca_trigger={self.settings.dca_trigger_pct}% "
-            f"max_legs={self.settings.max_dca_legs} "
-            f"leg_notional={self.settings.leg_notional_pct}% "
-            f"trail_arm={self.settings.trail_activate_pct}% "
-            f"trail_dist={self.settings.trail_distance_pct}%"
-        )
+        if self.settings.strategy == "trend":
+            print(
+                f"  trend: fast_ema={self.settings.fast_ema} slow_ema={self.settings.slow_ema} "
+                f"regime_ema={self.settings.trend_ema_period} atr={self.settings.atr_period} "
+                f"stop_atr={self.settings.stop_atr_multiplier}x trail_atr={self.settings.trail_atr_multiplier}x "
+                f"risk={self.settings.risk_per_trade_pct}% "
+                f"adx_min={self.settings.adx_min} vol_mult={self.settings.volume_min_mult} "
+                f"mtf={self.settings.mtf_enabled}"
+            )
+        else:
+            print(
+                f"  caps: {self.settings.long_max_prices} "
+                f"initial_dip={self.settings.initial_dip_pct}% "
+                f"dca_trigger={self.settings.dca_trigger_pct}% "
+                f"max_legs={self.settings.max_dca_legs} "
+                f"leg_notional={self.settings.leg_notional_pct}% "
+                f"trail_arm={self.settings.trail_activate_pct}% "
+                f"trail_dist={self.settings.trail_distance_pct}% "
+                f"chandelier={self.settings.dca_chandelier_enabled}"
+            )
         while True:
             try:
                 self.loop_count += 1

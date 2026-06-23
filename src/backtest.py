@@ -24,16 +24,22 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
+import bisect
+
 from .config import Settings, load_settings
+from .exchange import _timeframe_ms
 from .strategy import (
+    adx_ok,
     dca_trigger,
     entry_trigger,
+    htf_trend_ok,
     in_trend,
     price_in_zone,
     should_arm_trail,
     stop_loss_price,
     take_profit_price,
     trail_stop_price,
+    volume_ok,
 )
 from .strategy_trend import (
     atr_value,
@@ -223,11 +229,33 @@ def _close_bt_position(
 def run_backtest(
     settings: Settings,
     candles_by_symbol: Dict[str, List[list]],
+    htf_by_symbol: Optional[Dict[str, List[list]]] = None,
 ) -> BTResult:
-    """Replay candles through the DCA strategy."""
+    """Replay candles through the DCA strategy.
+
+    ``htf_by_symbol`` (optional) holds higher-timeframe candles for the MTF
+    filter; only consulted when ``MTF_ENABLED``.
+    """
     min_len = min(len(v) for v in candles_by_symbol.values())
     for sym in list(candles_by_symbol):
         candles_by_symbol[sym] = candles_by_symbol[sym][-min_len:]
+
+    # Higher-timeframe alignment data (MTF filter). Precompute each HTF candle's
+    # *close* time so we only ever look at bars fully closed by the current bar.
+    htf_by_symbol = htf_by_symbol or {}
+    htf_interval_ms = _timeframe_ms(settings.mtf_timeframe)
+    htf_close_times: Dict[str, List[int]] = {
+        sym: [int(r[0]) + htf_interval_ms for r in rows]
+        for sym, rows in htf_by_symbol.items()
+    }
+
+    def _htf_window(symbol: str, cur_open_ms: int) -> List[list]:
+        rows = htf_by_symbol.get(symbol)
+        if not rows:
+            return []
+        n = bisect.bisect_right(htf_close_times[symbol], cur_open_ms)
+        start = max(0, n - settings.lookback_candles)
+        return rows[start:n]
 
     equity = settings.initial_equity
     starting_equity = settings.initial_equity
@@ -308,6 +336,12 @@ def run_backtest(
                     continue
                 if not trend_signal(closed_window, settings, direction):
                     continue
+                if not adx_ok(closed_window, settings):
+                    continue
+                if not volume_ok(closed_window, settings):
+                    continue
+                if not htf_trend_ok(_htf_window(symbol, int(candle[0])), settings, direction):
+                    continue
                 if not risk.can_trade(candle_ts, equity):
                     continue
                 init_stop = initial_stop(close, atr, settings, direction)
@@ -339,6 +373,18 @@ def run_backtest(
                 )
                 continue
 
+            # Optional ATR chandelier trail for DCA exits (else percent trail).
+            dca_atr = (
+                atr_value(candles_by_symbol[symbol][i - lookback : i], settings)
+                if settings.dca_chandelier_enabled
+                else 0.0
+            )
+
+            def _dca_trail_stop(extreme: float, _atr: float = dca_atr, _dir: str = direction) -> float:
+                if settings.dca_chandelier_enabled and _atr > 0:
+                    return chandelier_stop(extreme, _atr, settings, _dir)
+                return trail_stop_price(extreme, settings, _dir)
+
             # --- 1. Manage open position (TP / trail / stop / DCA) ---
             if symbol in positions:
                 pos = positions[symbol]
@@ -367,15 +413,15 @@ def run_backtest(
                         if is_long
                         else min(pos.peak_price, low, close)
                     )
-                    pos.stop_price = trail_stop_price(pos.peak_price, settings, direction)
+                    pos.stop_price = _dca_trail_stop(pos.peak_price)
 
                 if pos.trail_armed:
                     if is_long and high > pos.peak_price:
                         pos.peak_price = high
-                        pos.stop_price = trail_stop_price(pos.peak_price, settings, direction)
+                        pos.stop_price = _dca_trail_stop(pos.peak_price)
                     elif not is_long and low < pos.peak_price:
                         pos.peak_price = low
-                        pos.stop_price = trail_stop_price(pos.peak_price, settings, direction)
+                        pos.stop_price = _dca_trail_stop(pos.peak_price)
 
                     trail_hit = low <= pos.stop_price if is_long else high >= pos.stop_price
                     if allow_exit and trail_hit:
@@ -435,6 +481,10 @@ def run_backtest(
             if not entry_trigger(closed_window, settings, direction):
                 continue
             if not in_trend(closed_window, settings, direction):
+                continue
+            if not volume_ok(closed_window, settings):
+                continue
+            if not htf_trend_ok(_htf_window(symbol, int(candle[0])), settings, direction):
                 continue
             if not risk.can_trade(candle_ts, equity):
                 continue
@@ -575,16 +625,20 @@ _SETTINGS_FLOATS = {
     "ENTRY_FEE_BPS", "EXIT_FEE_BPS", "SLIPPAGE_BPS",
     "CONSEC_HALT_HOURS", "DAILY_LOSS_HALT_HOURS",
     "RISK_PER_TRADE_PCT", "STOP_ATR_MULTIPLIER", "TRAIL_ATR_MULTIPLIER",
+    "ADX_MIN", "VOLUME_MIN_MULT",
 }
 _SETTINGS_INTS = {
     "POLL_SECONDS", "LOOKBACK_CANDLES", "MAX_CONSECUTIVE_LOSSES",
     "HIGH_LOOKBACK_CANDLES", "DIP_MEMORY_BARS", "MAX_DCA_LEGS",
     "HEARTBEAT_INTERVAL", "LIMIT_TIMEOUT_SECONDS", "TREND_EMA_PERIOD",
     "FAST_EMA", "SLOW_EMA", "ATR_PERIOD",
+    "ADX_PERIOD", "VOLUME_MA_PERIOD", "MTF_EMA_PERIOD",
 }
 _SETTINGS_BOOLS = {
     "REQUIRE_GREEN_CONFIRMATION", "TREND_FILTER_ENABLED",
+    "MTF_ENABLED", "DCA_CHANDELIER_ENABLED",
 }
+# String keys (e.g. MTF_TIMEFRAME) fall through to the default str handling.
 
 
 def _apply_overrides(settings: Settings, overrides: list[str]) -> Settings:
@@ -636,6 +690,20 @@ def main() -> None:
             candles_by_symbol[symbol] = json.load(f)
         print(f"Loaded {len(candles_by_symbol[symbol]):,} candles for {symbol}")
 
+    # Higher-timeframe data for the MTF filter (only when enabled).
+    htf_by_symbol: Dict[str, list] = {}
+    if settings.mtf_enabled:
+        for symbol in settings.symbols:
+            safe = symbol.replace("/", "-").replace(":", "-")
+            htf_path = data_dir / f"{safe}_{settings.mtf_timeframe}.json"
+            if not htf_path.exists():
+                print(f"ERROR: MTF_ENABLED but no HTF data at {htf_path}")
+                print(f"Run first:  python -m src.fetch_candles --timeframes {settings.mtf_timeframe}")
+                sys.exit(1)
+            with htf_path.open(encoding="utf-8") as f:
+                htf_by_symbol[symbol] = json.load(f)
+            print(f"Loaded {len(htf_by_symbol[symbol]):,} HTF ({settings.mtf_timeframe}) candles for {symbol}")
+
     flags: list[str] = [
         f"caps={settings.long_max_prices}",
         f"initial_dip={settings.initial_dip_pct}%",
@@ -650,7 +718,7 @@ def main() -> None:
     ]
     print(f"Flags: {', '.join(flags)}")
 
-    result = run_backtest(settings, candles_by_symbol)
+    result = run_backtest(settings, candles_by_symbol, htf_by_symbol)
     print_report(result, label=args.label)
 
 

@@ -1,38 +1,77 @@
-# Hyperliquid BTC/ETH Futures Bot (Paper-First)
+# Hyperliquid Futures Bot — Agentic & Paper-First
 
-Automated crypto futures bot for **BTC/USDC:USDC** and **ETH/USDC:USDC** perpetual swaps on Hyperliquid.
-Runs in paper mode by default -- live trading is intentionally disabled.
+Automated crypto futures bot for Hyperliquid perpetual swaps (default
+**BTC/USDC:USDC** and **ETH/USDC:USDC**). Runs in **paper mode** by default;
+live trading is gated behind credentials. Every agent surface (web dashboard,
+MCP server, two-way Telegram) is read + pause/resume only — agents can **never**
+open, close, or modify a position.
 
-## Strategy
+## Strategies
 
-**EMA crossover + ATR volatility filter**, with optional higher-timeframe confirmation and trailing stops.
+The bot ships with two interchangeable, **direction-aware** strategies, selected
+by `STRATEGY` in `.env`. A symbol listed in `SHORT_SYMBOLS` trades the mirror
+(short) logic; everything else is long.
+
+### `STRATEGY=dca` — dip-buying DCA (mean-reversion)
 
 | Step | Detail |
 |------|--------|
-| Signal | Fast EMA crosses above slow EMA -> long; below -> short. Flat when ATR < `ATR_MIN_PCT`. |
-| HTF filter | If `HTF_TIMEFRAME` is set, the signal must agree with the higher-timeframe EMA trend. |
-| Volume filter | If `VOLUME_MIN_MULT` > 0, latest candle volume must exceed the rolling average by that factor. |
-| Entry | Limit order at current price (+ maker/taker fee-edge tolerance) for immediate fill. |
-| Stop / TP | ATR-based. Stop = `STOP_ATR_MULTIPLIER` x ATR away; TP = stop distance x `TAKE_PROFIT_R`. ATR source is configurable (`STOP_ATR_SOURCE`). |
-| Trailing stop | When enabled (`TRAIL_AFTER_R` > 0), the stop ratchets toward price after reaching N x R in profit. Trail distance = `TRAIL_ATR_MULTIPLIER` x ATR. |
-| Exit trigger | Current candle high/low checked against stop/TP each poll. Skipped on the entry candle. |
-| Signals | Generated from **closed candles only** (the forming candle is excluded). |
+| Entry (long) | Open the first leg when a recent bar dipped ≥ `INITIAL_DIP_PCT` below the local high, confirmed by a green bar; gated by the EMA trend filter and per-symbol price cap. |
+| DCA add | Add a leg when price falls a further `DCA_TRIGGER_PCT` below the last fill (up to `MAX_DCA_LEGS`). |
+| Exit | Percent trailing stop (`TRAIL_ACTIVATE_PCT` to arm, `TRAIL_DISTANCE_PCT` to trail), plus optional hard `STOP_LOSS_PCT` and `TAKE_PROFIT_PCT`. |
+| Trend filter | When `TREND_FILTER_ENABLED`, only trade with price on the right side of the `TREND_EMA_PERIOD` EMA. |
+
+### `STRATEGY=trend` — EMA/ATR trend-following (recommended)
+
+| Step | Detail |
+|------|--------|
+| Entry (long) | `FAST_EMA` > `SLOW_EMA` **and** price > `TREND_EMA_PERIOD` (regime) EMA. |
+| Initial stop | `STOP_ATR_MULTIPLIER` × ATR from entry. |
+| Trailing stop | ATR "chandelier": `TRAIL_ATR_MULTIPLIER` × ATR from the favorable extreme (wide = let winners run). |
+| Soft exit | Close when the fast/slow EMA cross flips against the position. |
+| Sizing | Fixed-fractional: risk `RISK_PER_TRADE_PCT` of equity per trade (size = risk ÷ stop distance), capped by `MAX_LEVERAGE`. |
+
+Backtest (22 months, 4h BTC/ETH, `STRATEGY=trend`): **+11.7%** return, **1.27**
+profit factor, **16.4%** max drawdown — a ~35% win rate with average win ≈ 2.4×
+average loss. Backtested, not live; figures depend on the window and parameters.
+
+### Entry-quality filters (opt-in)
+
+Four filters can tighten entries on top of either strategy. **All are disabled by
+default**, so the backtested figures above and existing behaviour are unchanged
+until you turn one on. They live in the shared strategy functions, so the live
+bot and the backtester apply them identically.
+
+| Filter | Knob(s) | Rule | Applies to |
+|--------|---------|------|------------|
+| **ADX chop filter** | `ADX_MIN` (0=off), `ADX_PERIOD` | Skip entries unless Wilder ADX ≥ `ADX_MIN` (e.g. 25) — stand aside in ranging markets | `trend` only |
+| **Volume confirmation** | `VOLUME_MIN_MULT` (0=off), `VOLUME_MA_PERIOD` | Entry bar volume must exceed `VOLUME_MIN_MULT` × the volume average (e.g. 1.5×) | both |
+| **MTF alignment** | `MTF_ENABLED`, `MTF_TIMEFRAME`, `MTF_EMA_PERIOD` | Longs only when the higher timeframe closes above its EMA (mirror for shorts) | both |
+| **DCA chandelier** | `DCA_CHANDELIER_ENABLED` | Use an ATR chandelier trail (`TRAIL_ATR_MULTIPLIER` × ATR from the extreme) for the DCA exit instead of the percent trail | `dca` only |
+
+Backtesting the MTF filter needs cached higher-timeframe candles too:
+`python -m src.fetch_candles --timeframes 4h`. The backtester errors with a clear
+hint if `MTF_ENABLED=true` but the HTF data file is missing.
+
+### Startup state reconciliation (live mode)
+
+On startup, `LiveBroker` queries Hyperliquid for any open positions and adopts
+them into its internal state before trading resumes. This prevents a restart
+(crash, deploy, reboot) from treating an account with live exposure as flat and
+opening a duplicate position. Trail state is reset and re-ratchets from live
+candles on subsequent ticks.
 
 ## Risk Engine
 
 | Guard | Trigger | Action |
 |-------|---------|--------|
-| Per-trade sizing | `RISK_PER_TRADE_PCT` of equity / per-unit risk | Caps position size |
+| Per-trade sizing | strategy sizing (DCA leg notional or trend risk %) | Caps position size |
 | Max leverage | Notional > `MAX_LEVERAGE` x equity | Caps position size |
 | Consecutive losses | Streak >= `MAX_CONSECUTIVE_LOSSES` | Halt all trading for `CONSEC_HALT_HOURS` |
 | Rolling drawdown | Drawdown from window start >= `MAX_DAILY_LOSS_PCT` | Halt all trading for `DAILY_LOSS_HALT_HOURS` |
-| Cooldown | After a stop exit | Block same-direction re-entry for `COOLDOWN_CANDLES` x timeframe minutes |
-| Post-stop pause | After a stop/trail exit | Block any-direction re-entry for `POST_STOP_CANDLES` x timeframe minutes |
 
 Halts are **timer-based** -- the bot automatically resumes after the configured hours. The risk window (equity baseline + loss streak) resets when a halt expires.
 
-Recommended from recent backtests: `POST_STOP_CANDLES=1`, `COOLDOWN_CANDLES=0`.
-post_stop=2, cooldown=12
 ## Quick Start
 
 ### 1. Python environment
@@ -58,14 +97,14 @@ For Hyperliquid, credentials (`HL_WALLET_ADDRESS`, `HL_PRIVATE_KEY`) are only re
 python -m src.fetch_candles --days 45
 ```
 
-This downloads OHLCV candles to `data/` for both the primary and HTF timeframes.
+This downloads OHLCV candles to `data/` for the configured timeframe(s) used by the backtester.
 
 ### 4. Backtest
 
 ```powershell
-python -m src.backtest
-python -m src.backtest --set TAKE_PROFIT_R=1.5 STOP_ATR_MULTIPLIER=2.0
-python -m src.backtest --cooldown 12 --label TIGHT_CD
+python -m src.backtest --env .env
+python -m src.backtest --env .env --set STRATEGY=trend TIMEFRAME=4h LOOKBACK_CANDLES=400
+python -m src.backtest --env .env --set STRATEGY=dca STOP_LOSS_PCT=30 TAKE_PROFIT_PCT=20
 ```
 
 ### 5. Run the bot
@@ -148,7 +187,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODE` | `paper` | `paper` or `live` (live is blocked in this version) |
+| `MODE` | `paper` | `paper` (simulated fills) or `live` (real orders; requires credentials) |
 | `HL_WALLET_ADDRESS` | | Your 0x… EVM wallet address |
 | `HL_PRIVATE_KEY` | | Hex private key for the wallet |
 | `HL_TESTNET` | `false` | Use Hyperliquid testnet (`true` / `false`) |
@@ -158,10 +197,12 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SYMBOLS` | `BTC/USDC:USDC,ETH/USDC:USDC` | Comma-separated perpetual symbols (base coin before `/`, e.g. `BTC`) |
-| `TIMEFRAME` | `5m` | Primary candle timeframe |
-| `POLL_SECONDS` | `20` | Seconds between each polling loop |
+| `SHORT_SYMBOLS` | (empty) | Bases traded short-only (mirror logic); others are long. Empty = long-only |
+| `STRATEGY` | `dca` | `dca` (dip-buying) or `trend` (EMA/ATR trend-following) |
+| `TIMEFRAME` | `15m` | Primary candle timeframe (use `4h` for `STRATEGY=trend`) |
+| `POLL_SECONDS` | `30` | Seconds between each polling loop |
 | `LOOKBACK_CANDLES` | `200` | Number of candles fetched for indicator calculation |
-| `HEARTBEAT_INTERVAL` | `1` | Print/log heartbeat every N loops |
+| `HEARTBEAT_INTERVAL` | `5` | Print/log heartbeat every N loops |
 
 ### Position Sizing
 
@@ -169,7 +210,6 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 |----------|---------|-------------|
 | `INITIAL_EQUITY` | `10000` | Starting paper equity (USD) |
 | `MAX_LEVERAGE` | `3` | Max notional / equity ratio |
-| `RISK_PER_TRADE_PCT` | `0.5` | Equity % risked per trade |
 
 ### Risk Guards
 
@@ -179,29 +219,46 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `MAX_CONSECUTIVE_LOSSES` | `3` | Loss streak that triggers a halt |
 | `CONSEC_HALT_HOURS` | `6` | Hours to pause after consecutive-loss halt |
 | `DAILY_LOSS_HALT_HOURS` | `12` | Hours to pause after drawdown halt |
-| `COOLDOWN_CANDLES` | `0` | Candles to wait after stop exit before same-direction re-entry |
-| `POST_STOP_CANDLES` | `0` | Candles to wait after stop/trail exit before any-direction re-entry |
 
-### Strategy
+### Strategy — DCA (`STRATEGY=dca`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FAST_EMA` | `20` | Fast EMA period |
-| `SLOW_EMA` | `50` | Slow EMA period |
-| `ATR_PERIOD` | `14` | ATR lookback |
-| `ATR_MIN_PCT` | `0.2` | Minimum ATR as % of price to generate a signal |
-| `STOP_ATR_MULTIPLIER` | `1.8` | Stop distance = ATR x this |
-| `TAKE_PROFIT_R` | `1.5` | TP distance = stop distance x this |
-| `HTF_TIMEFRAME` | `1h` | Higher-timeframe for trend confirmation (empty to disable) |
-| `STOP_ATR_SOURCE` | `primary` | `primary` or `htf` -- which timeframe's ATR to use for stop/TP |
-| `VOLUME_MIN_MULT` | `0.0` | Min volume as multiple of rolling average (0 = disabled) |
+| `LONG_MAX_PRICES` | `BTC:90000,ETH:3000` | Per-symbol long-entry price ceiling (shorts ignore it) |
+| `INITIAL_DIP_PCT` | `3.0` | % drop from the recent high to open the first leg |
+| `DCA_TRIGGER_PCT` | `10.0` | % further move past the last fill to add a leg |
+| `LEG_NOTIONAL_PCT` | `10.0` | % of starting equity per leg |
+| `MAX_DCA_LEGS` | `5` | Max legs per symbol |
+| `TRAIL_ACTIVATE_PCT` | `5.0` | Arm the trailing stop once this far in profit |
+| `TRAIL_DISTANCE_PCT` | `3.0` | Trail distance from the favorable extreme |
+| `STOP_LOSS_PCT` | `0` | Hard stop (0 = disabled) |
+| `TAKE_PROFIT_PCT` | `0` | Fixed take-profit (0 = disabled) |
+| `TREND_FILTER_ENABLED` | `true` | Only trade with the `TREND_EMA_PERIOD` EMA trend |
+| `TREND_EMA_PERIOD` | `200` | EMA period for the trend / regime filter (shared with trend mode) |
 
-### Trailing Stop
+### Strategy — Trend-following (`STRATEGY=trend`, best on `TIMEFRAME=4h`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRAIL_AFTER_R` | `0.0` | Activate trailing stop after this many R in profit (0 = disabled) |
-| `TRAIL_ATR_MULTIPLIER` | `2.0` | Trail distance = ATR x this |
+| `FAST_EMA` | `50` | Fast EMA for the trend cross |
+| `SLOW_EMA` | `200` | Slow EMA for the trend cross |
+| `ATR_PERIOD` | `14` | ATR lookback for stops/sizing |
+| `STOP_ATR_MULTIPLIER` | `3.0` | Initial stop = entry -/+ this × ATR |
+| `TRAIL_ATR_MULTIPLIER` | `6.0` | Chandelier trail = extreme -/+ this × ATR |
+| `RISK_PER_TRADE_PCT` | `1.0` | % of equity risked per trade (sets size from stop distance) |
+
+### Entry-quality filters (opt-in, off by default)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ADX_MIN` | `0` | Min Wilder ADX to allow `trend` entries (e.g. `25`); `0` disables |
+| `ADX_PERIOD` | `14` | ADX lookback |
+| `VOLUME_MIN_MULT` | `0` | Entry bar volume must exceed this × the volume average (e.g. `1.5`); `0` disables |
+| `VOLUME_MA_PERIOD` | `20` | Lookback for the volume average |
+| `MTF_ENABLED` | `false` | Require higher-timeframe trend alignment for entries |
+| `MTF_TIMEFRAME` | `4h` | Higher timeframe for the MTF filter |
+| `MTF_EMA_PERIOD` | `50` | EMA period on the higher timeframe |
+| `DCA_CHANDELIER_ENABLED` | `false` | Use an ATR chandelier trail for the `dca` exit instead of the percent trail |
 
 ### Execution
 
@@ -238,10 +295,11 @@ The Telegram control listener and MCP server reuse `TELEGRAM_BOT_TOKEN`, `TELEGR
 
 ```
 src/
-  main.py           Entry point -- blocks live mode, runs paper bot
-  bot.py            Main polling loop and per-symbol processing
+  main.py           Entry point -- loads settings, runs bot (+ optional briefing/control threads)
+  bot.py            Main polling loop and per-symbol processing (DCA + trend paths)
   exchange.py       Hyperliquid official SDK adapter (with retry) + paper / live broker
-  strategy.py       EMA crossover / ATR / volume / HTF signals
+  strategy.py       STRATEGY=dca: dip-buying / DCA / trail / SL / TP (direction-aware)
+  strategy_trend.py STRATEGY=trend: EMA cross + regime, ATR stops, chandelier trail, risk sizing
   risk.py           Position sizing and timer-based halt logic
   config.py         Loads Settings from .env
   models.py         Shared types: Position, TradeResult, PendingOrder

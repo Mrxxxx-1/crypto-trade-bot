@@ -45,6 +45,80 @@ def compute_atr(ohlcv: List[List[float]], period: int) -> float:
     return sum(recent) / len(recent)
 
 
+def compute_adx(ohlcv: List[List[float]], period: int) -> float:
+    """Wilder's Average Directional Index over the last ``period`` bars.
+
+    Measures trend *strength* (not direction): low ADX = choppy/ranging,
+    high ADX = a strong directional move. Returns 0.0 when there isn't enough
+    data (needs ~2*period+1 bars for a stable value).
+    """
+    if period <= 0 or len(ohlcv) < 2 * period + 1:
+        return 0.0
+
+    trs: List[float] = []
+    plus_dm: List[float] = []
+    minus_dm: List[float] = []
+    for i in range(1, len(ohlcv)):
+        high = float(ohlcv[i][2])
+        low = float(ohlcv[i][3])
+        prev_high = float(ohlcv[i - 1][2])
+        prev_low = float(ohlcv[i - 1][3])
+        prev_close = float(ohlcv[i - 1][4])
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    def _wilder_smooth(values: List[float]) -> List[float]:
+        """Running Wilder smoothing; returns the smoothed series."""
+        if len(values) < period:
+            return []
+        smoothed = [sum(values[:period])]
+        for v in values[period:]:
+            smoothed.append(smoothed[-1] - smoothed[-1] / period + v)
+        return smoothed
+
+    tr_s = _wilder_smooth(trs)
+    plus_s = _wilder_smooth(plus_dm)
+    minus_s = _wilder_smooth(minus_dm)
+    if not tr_s or len(plus_s) != len(tr_s) or len(minus_s) != len(tr_s):
+        return 0.0
+
+    dxs: List[float] = []
+    for tr_v, p_v, m_v in zip(tr_s, plus_s, minus_s):
+        if tr_v <= 0:
+            continue
+        plus_di = 100.0 * (p_v / tr_v)
+        minus_di = 100.0 * (m_v / tr_v)
+        denom = plus_di + minus_di
+        if denom <= 0:
+            continue
+        dxs.append(100.0 * abs(plus_di - minus_di) / denom)
+
+    if len(dxs) < period:
+        return 0.0
+    # ADX = Wilder-smoothed average of DX over the period.
+    adx = sum(dxs[:period]) / period
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return adx
+
+
+def adx_ok(closed_ohlcv: List[List[float]], settings: Settings) -> bool:
+    """True when trend strength clears the chop filter (``ADX >= ADX_MIN``).
+
+    Disabled (always True) when ``ADX_MIN <= 0``. While below the threshold the
+    market is treated as choppy and crossover entries are suppressed.
+    """
+    if settings.adx_min <= 0:
+        return True
+    adx = compute_adx(closed_ohlcv, settings.adx_period)
+    if adx <= 0:
+        return False  # not enough data / undefined -> stay out
+    return adx >= settings.adx_min
+
+
 def compute_ema(values: List[float], period: int) -> float:
     """Standard EMA over ``values``; seeds from the first value. 0.0 if empty."""
     if not values or period <= 0:
@@ -54,6 +128,45 @@ def compute_ema(values: List[float], period: int) -> float:
     for v in values[1:]:
         ema = v * k + ema * (1.0 - k)
     return ema
+
+
+def volume_ok(closed_ohlcv: List[List[float]], settings: Settings) -> bool:
+    """Confirm the latest closed bar traded on above-average volume.
+
+    Rule: ``last_volume > VOLUME_MIN_MULT * SMA(volume, VOLUME_MA_PERIOD)``.
+    Disabled (always True) when ``VOLUME_MIN_MULT <= 0``. Returns False until
+    there is enough data for the moving average.
+    """
+    if settings.volume_min_mult <= 0:
+        return True
+    period = max(1, settings.volume_ma_period)
+    if len(closed_ohlcv) < period + 1:
+        return False
+    vols = [float(c[5]) for c in closed_ohlcv]
+    ma = sum(vols[-period:]) / period
+    if ma <= 0:
+        return False
+    return vols[-1] > settings.volume_min_mult * ma
+
+
+def htf_trend_ok(htf_closed_ohlcv: List[List[float]], settings: Settings, direction: str = LONG) -> bool:
+    """Multi-timeframe alignment gate against the higher-timeframe EMA.
+
+    Long entries require HTF close > HTF ``MTF_EMA_PERIOD`` EMA; short entries
+    require HTF close < that EMA. Disabled (always True) when ``MTF_ENABLED`` is
+    False. Returns False until enough HTF data exists for the EMA.
+    """
+    if not settings.mtf_enabled:
+        return True
+    period = settings.mtf_ema_period
+    if period <= 0:
+        return True
+    closes = [float(c[4]) for c in htf_closed_ohlcv]
+    if len(closes) < period:
+        return False
+    ema = compute_ema(closes, period)
+    last = closes[-1]
+    return last < ema if direction == SHORT else last > ema
 
 
 def in_trend(closed_ohlcv: List[List[float]], settings: Settings, direction: str = LONG) -> bool:

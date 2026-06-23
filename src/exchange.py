@@ -125,6 +125,15 @@ class ExchangeAdapter:
         return float(mids[coin])
 
     def fetch_balance(self) -> float:
+        """Total USDC equity available for sizing.
+
+        On a Hyperliquid **unified account**, USDC sits in the spot wallet and is
+        only pulled into the perps wallet as margin when a position is opened, so
+        the perps ``accountValue`` reflects just the *committed* margin (and is 0
+        while flat). For position sizing we want the whole bankroll, so we return
+        perps ``accountValue`` (includes open-position margin + unrealized PnL)
+        **plus** the free spot USDC balance.
+        """
         addr = self.settings.wallet_address.strip()
         if not addr:
             return self.settings.initial_equity
@@ -133,7 +142,52 @@ class ExchangeAdapter:
             return self._info.user_state(addr)
 
         st = self._retry(_state)
-        return float(st["marginSummary"]["accountValue"])
+        perps = float(st["marginSummary"]["accountValue"])
+
+        spot_usdc = 0.0
+        try:
+            sp = self._retry(lambda: self._info.spot_user_state(addr))
+            for bal in sp.get("balances", []) or []:
+                if str(bal.get("coin", "")).upper() == "USDC":
+                    spot_usdc = float(bal.get("total", 0) or 0)
+                    break
+        except Exception:  # noqa: BLE001
+            pass  # spot lookup is best-effort; fall back to perps-only
+
+        return perps + spot_usdc
+
+    def fetch_positions(self) -> List[dict[str, Any]]:
+        """Open perp positions from the live account.
+
+        Returns one dict per non-zero position:
+        ``{"coin", "side", "size", "entry_price", "unrealized_pnl"}`` where
+        ``size`` is absolute and ``side`` is ``"buy"`` (long) / ``"sell"`` (short).
+        Empty list if no wallet is configured or nothing is open.
+        """
+        addr = self.settings.wallet_address.strip()
+        if not addr:
+            return []
+
+        def _state() -> dict[str, Any]:
+            return self._info.user_state(addr)
+
+        st = self._retry(_state)
+        out: List[dict[str, Any]] = []
+        for ap in st.get("assetPositions", []) or []:
+            pos = ap.get("position") or {}
+            szi = float(pos.get("szi", 0) or 0)
+            if szi == 0:
+                continue
+            out.append(
+                {
+                    "coin": str(pos.get("coin", "")),
+                    "side": "buy" if szi > 0 else "sell",
+                    "size": abs(szi),
+                    "entry_price": float(pos.get("entryPx", 0) or 0),
+                    "unrealized_pnl": float(pos.get("unrealizedPnl", 0) or 0),
+                }
+            )
+        return out
 
     @staticmethod
     def _normalize_bulk_statuses(result: dict[str, Any]) -> dict[str, Any]:
@@ -589,6 +643,7 @@ class LiveBroker(_BrokerBase):
     def __init__(self, settings: Settings, exchange: ExchangeAdapter) -> None:
         super().__init__(settings, exchange)
         self._sync_equity()
+        self._reconcile_positions()
         for sym in settings.symbols:
             exchange.set_leverage(int(settings.max_leverage), sym)
 
@@ -597,6 +652,62 @@ class LiveBroker(_BrokerBase):
             self.equity = self.exchange.fetch_balance()
         except Exception:  # noqa: BLE001
             pass  # keep last known equity
+
+    def _reconcile_positions(self) -> None:
+        """Adopt positions already open on Hyperliquid at startup.
+
+        Without this, a restart (crash, deploy, reboot) leaves ``self.positions``
+        empty while real exposure is open on the exchange — the bot would then
+        open a *second* position and never manage the orphaned one. We rebuild a
+        single-leg ``Position`` per live position so the strategy can resume
+        managing its exit. Trail state (peak/stop) is intentionally reset and
+        will re-ratchet from live candles on the next ticks.
+        """
+        try:
+            live = self.exchange.fetch_positions()
+        except Exception as exc:  # noqa: BLE001
+            self.log_event("reconcile_error", {"error": str(exc)})
+            return
+        if not live:
+            return
+
+        # Map exchange coin (e.g. "BTC") back to a configured symbol.
+        coin_to_symbol = {hl_coin(sym): sym for sym in self.settings.symbols}
+        for lp in live:
+            symbol = coin_to_symbol.get(lp["coin"])
+            if symbol is None:
+                self.log_event(
+                    "reconcile_skip",
+                    {"coin": lp["coin"], "reason": "not in configured SYMBOLS"},
+                )
+                continue
+            entry = lp["entry_price"]
+            size = lp["size"]
+            leg = Leg(size=size, entry_price=entry, opened_at=self._now(), fee=0.0)
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                side=lp["side"],
+                size=size,
+                entry_price=entry,
+                opened_at=self._now(),
+                legs=[leg],
+                last_fill_price=entry,
+                peak_price=entry,
+            )
+            self.log_event(
+                "position_reconciled",
+                {
+                    "symbol": symbol,
+                    "side": lp["side"],
+                    "size": size,
+                    "entry_price": entry,
+                    "unrealized_pnl": lp["unrealized_pnl"],
+                },
+            )
+            print(
+                f"[reconcile] adopted open {lp['side']} {symbol} "
+                f"size={size} entry={entry} (uPnL={lp['unrealized_pnl']:+.2f})"
+            )
 
     # ------------------------------------------------------------------
     # Limit entry flow (real orders)
