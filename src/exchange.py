@@ -8,6 +8,7 @@ actions when ``HL_PRIVATE_KEY`` is set. ``PaperBroker`` simulates fills;
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -70,6 +71,7 @@ class ExchangeAdapter:
         self.settings = settings
         base = TESTNET_API_URL if settings.testnet else MAINNET_API_URL
         self._info = Info(base_url=base, skip_ws=True, timeout=15.0)
+        self._sz_decimals: Optional[Dict[str, int]] = None
         self._hlx: Optional[HLExchange] = None
         if settings.private_key:
             wallet = Account.from_key(settings.private_key)
@@ -99,6 +101,32 @@ class ExchangeAdapter:
         if self._hlx is None:
             raise RuntimeError("Signing requires HL_PRIVATE_KEY in .env")
         return self._hlx
+
+    def _asset_sz_decimals(self) -> Dict[str, int]:
+        """Per-coin ``szDecimals`` from the perp ``meta`` (fetched once, cached)."""
+        if self._sz_decimals is None:
+            meta = self._retry(lambda: self._info.meta())
+            self._sz_decimals = {
+                a["name"]: int(a["szDecimals"])
+                for a in meta.get("universe", [])
+                if "name" in a and "szDecimals" in a
+            }
+        return self._sz_decimals
+
+    def round_size(self, symbol: str, size: float) -> float:
+        """Floor ``size`` to the asset's ``szDecimals``.
+
+        Hyperliquid rejects orders whose size carries more precision than the
+        asset allows (the SDK raises ``float_to_wire causes rounding``). We
+        floor (never round up) so the position can't exceed the risk-based
+        size. Returns 0.0 if the size floors below the smallest increment.
+        """
+        coin = hl_coin(symbol)
+        decimals = self._asset_sz_decimals().get(coin)
+        if decimals is None:
+            return size
+        factor = 10 ** decimals
+        return math.floor(size * factor) / factor
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         coin = hl_coin(symbol)
@@ -218,6 +246,9 @@ class ExchangeAdapter:
         x = self._require_exchange()
         coin = hl_coin(symbol)
         is_buy = side == "buy"
+        amount = self.round_size(symbol, amount)
+        if amount <= 0:
+            raise RuntimeError(f"order size rounds to zero for {coin}")
 
         def _place() -> dict[str, Any]:
             return x.order(
@@ -239,6 +270,9 @@ class ExchangeAdapter:
         coin = hl_coin(symbol)
         params = params or {}
         reduce_only = bool(params.get("reduceOnly"))
+        amount = self.round_size(symbol, amount)
+        if amount <= 0:
+            raise RuntimeError(f"order size rounds to zero for {coin}")
 
         def _go() -> dict[str, Any]:
             if reduce_only:

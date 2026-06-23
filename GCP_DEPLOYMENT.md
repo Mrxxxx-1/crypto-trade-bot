@@ -451,7 +451,7 @@ cd ~/crypto-trade-bot
 git pull
 source .venv/bin/activate
 pip install -r requirements.txt
-sudo systemctl restart crypto-bot
+sudo systemctl restart crypto-bot crypto-telegram crypto-dashboard
 ```
 
 ## Troubleshooting
