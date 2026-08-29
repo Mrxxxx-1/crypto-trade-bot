@@ -7,9 +7,13 @@
 # Usage:
 #   .\scripts\sync-logs.ps1
 #   .\scripts\sync-logs.ps1 -Tail
+#   .\scripts\sync-logs.ps1 -Force   # overwrite local even if scp skips unchanged files
 param(
-    [switch]$Tail
+    [switch]$Tail,
+    [switch]$Force
 )
+
+$LogFiles = @("events.jsonl", "trades.jsonl", "briefings.jsonl", "control.json", "briefing_state.json")
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -32,15 +36,40 @@ $DeployPath = if ($env:GCP_DEPLOY_PATH) { $env:GCP_DEPLOY_PATH } else { "~/crypt
 $RemoteLogs = if ($env:GCP_REMOTE_LOGS) { $env:GCP_REMOTE_LOGS } else { "logs" }
 $LocalLogs = if ($env:GCP_LOCAL_LOGS) { $env:GCP_LOCAL_LOGS } else { Join-Path $Root "logs" }
 
+$ScpArgs = @()
+if ($env:GCP_SSH_IDENTITY_FILE) {
+    $identity = $env:GCP_SSH_IDENTITY_FILE
+    if (-not [System.IO.Path]::IsPathRooted($identity)) {
+        $identity = Join-Path $Root $identity
+    }
+    if (-not (Test-Path $identity)) {
+        throw "GCP_SSH_IDENTITY_FILE not found: $identity"
+    }
+    $ScpArgs += "-i", $identity
+}
+
 New-Item -ItemType Directory -Force -Path $LocalLogs | Out-Null
 $Remote = "${env:GCP_SSH_USER}@${env:GCP_SSH_HOST}:${DeployPath}/${RemoteLogs}/"
 
 Write-Host "Syncing $Remote -> $LocalLogs\"
-$patterns = @("events.jsonl", "trades.jsonl", "briefings.jsonl", "control.json", "briefing_state.json")
-foreach ($name in $patterns) {
+$copied = 0
+foreach ($name in $LogFiles) {
     $src = "${env:GCP_SSH_USER}@${env:GCP_SSH_HOST}:${DeployPath}/${RemoteLogs}/${name}"
-    scp $src $LocalLogs 2>$null
+    $dest = Join-Path $LocalLogs $name
+    if ($Force -and (Test-Path $dest)) {
+        Remove-Item -Force $dest
+    }
+    scp @ScpArgs $src $LocalLogs 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $copied++
+    } else {
+        Write-Warning "Skipped ${name} (missing on VM or scp failed)"
+    }
 }
+if ($copied -eq 0) {
+    throw "No log files copied — check SSH access and GCP_SSH_IDENTITY_FILE in scripts\.deploy.local"
+}
+Write-Host "Copied $copied file(s)."
 
 Write-Host "Done. Local logs:"
 Get-ChildItem $LocalLogs

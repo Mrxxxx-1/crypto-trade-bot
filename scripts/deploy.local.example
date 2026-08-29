@@ -5,6 +5,11 @@ GCP_SSH_HOST=YOUR_VM_EXTERNAL_IP
 GCP_SSH_USER=YOUR_LINUX_USERNAME
 GCP_DEPLOY_PATH=/home/YOUR_LINUX_USERNAME/crypto-trade-bot
 
+# Private key that can SSH as GCP_SSH_USER (repo-relative or absolute path).
+# Use the same key pair whose public half is in ~/.ssh/authorized_keys on the VM
+# (e.g. gcp_actions_deploy after CI/CD setup).
+GCP_SSH_IDENTITY_FILE=gcp_actions_deploy
+
 # Optional overrides
 # GCP_REMOTE_LOGS=logs
 # GCP_LOCAL_LOGS=logs
