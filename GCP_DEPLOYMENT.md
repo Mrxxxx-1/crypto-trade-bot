@@ -483,6 +483,22 @@ nano ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
+**Passwordless `systemctl` for deploy restarts** (required — GitHub Actions cannot type
+your sudo password):
+
+On the **VM**, allow your deploy user to restart bot services without a password:
+
+```bash
+# replace mrx10210 if your Linux username differs
+echo 'mrx10210 ALL=(ALL) NOPASSWD: /bin/systemctl restart crypto-bot, /bin/systemctl restart crypto-dashboard, /bin/systemctl restart crypto-telegram' \
+  | sudo tee /etc/sudoers.d/crypto-bot-deploy
+sudo chmod 440 /etc/sudoers.d/crypto-bot-deploy
+sudo visudo -c
+sudo -n systemctl restart crypto-bot && echo "passwordless sudo OK"
+```
+
+See also `scripts/sudoers-crypto-deploy.example`.
+
 In **GitHub → Settings → Secrets**, set `GCP_SSH_PRIVATE_KEY` to the full contents
 of `gcp_actions_deploy` (the private key file).
 

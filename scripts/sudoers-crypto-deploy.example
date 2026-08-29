@@ -1,0 +1,12 @@
+# Passwordless systemctl for CI/CD deploy (GitHub Actions SSH user).
+# Install on the VM (once), replacing USERNAME with your Linux user (e.g. mrx10210):
+#
+#   sudo cp scripts/sudoers-crypto-deploy.example /etc/sudoers.d/crypto-bot-deploy
+#   sudo sed -i 's/USERNAME/YOUR_LINUX_USER/' /etc/sudoers.d/crypto-bot-deploy
+#   sudo chmod 440 /etc/sudoers.d/crypto-bot-deploy
+#   sudo visudo -c
+#   sudo -n systemctl restart crypto-bot && echo "passwordless sudo OK"
+#
+# Or paste this line into sudo visudo -f /etc/sudoers.d/crypto-bot-deploy
+
+USERNAME ALL=(ALL) NOPASSWD: /bin/systemctl restart crypto-bot, /bin/systemctl restart crypto-dashboard, /bin/systemctl restart crypto-telegram

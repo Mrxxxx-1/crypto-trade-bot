@@ -26,7 +26,11 @@ restart_if_enabled() {
   local svc="$1"
   if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
     echo "    restarting ${svc}"
-    sudo systemctl restart "$svc"
+    if ! sudo -n systemctl restart "$svc"; then
+      echo "ERROR: passwordless sudo required to restart ${svc}." >&2
+      echo "On the VM, configure /etc/sudoers.d/crypto-bot-deploy — see GCP_DEPLOYMENT.md §13." >&2
+      exit 1
+    fi
   else
     echo "    skipping ${svc} (not enabled)"
   fi
