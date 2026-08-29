@@ -1,0 +1,11 @@
+# Copy to `.deploy.local` (gitignored) for local scripts — sync-logs, tunnel-dashboard.
+# Do not commit real hostnames or keys.
+
+GCP_SSH_HOST=YOUR_VM_EXTERNAL_IP
+GCP_SSH_USER=YOUR_LINUX_USERNAME
+GCP_DEPLOY_PATH=/home/YOUR_LINUX_USERNAME/crypto-trade-bot
+
+# Optional overrides
+# GCP_REMOTE_LOGS=logs
+# GCP_LOCAL_LOGS=logs
+# GCP_DASHBOARD_PORT=8000

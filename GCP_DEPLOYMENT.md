@@ -454,6 +454,133 @@ pip install -r requirements.txt
 sudo systemctl restart crypto-bot crypto-telegram crypto-dashboard
 ```
 
+Or use CI/CD (section 13): push to `main` and GitHub Actions runs the same steps via `scripts/remote-update.sh`.
+
+## 13) CI/CD (GitHub Actions → GCP)
+
+Push to `main` runs **CI** (compile + import smoke test), then **deploys** to your VM
+over SSH. Pull requests only run CI.
+
+### One-time setup
+
+**On the VM** (if not already done): clone the repo, create `.env`, enable
+`crypto-bot` systemd — see steps 3–8 above. The deploy workflow does **not**
+create or overwrite `.env`.
+
+**SSH key for GitHub Actions → VM:**
+
+On your laptop (or any secure machine):
+
+```bash
+ssh-keygen -t ed25519 -f gcp_actions_deploy -N ""
+```
+
+On the **VM**, append the **public** key to `~/.ssh/authorized_keys`:
+
+```bash
+# paste contents of gcp_actions_deploy.pub
+nano ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+In **GitHub → Settings → Secrets**, set `GCP_SSH_PRIVATE_KEY` to the full contents
+of `gcp_actions_deploy` (the private key file).
+
+**Private repo:** the VM also needs git read access — add a separate
+[deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)
+(read-only) to the repo and configure `~/.ssh` on the VM for `git fetch`.
+Public repos need no extra git auth.
+
+**GitHub repository secrets** (Settings → Secrets and variables → Actions):
+
+| Secret | Example | Purpose |
+|--------|---------|---------|
+| `GCP_SSH_HOST` | `35.200.32.57` | VM external IP |
+| `GCP_SSH_USER` | `mrx10210` | Linux username on the VM |
+| `GCP_SSH_PRIVATE_KEY` | `-----BEGIN OPENSSH PRIVATE KEY-----…` | Private key that can SSH as `GCP_SSH_USER` |
+| `GCP_DEPLOY_PATH` | `/home/mrx10210/crypto-trade-bot` | Optional; full path on VM (recommended over `~`) |
+
+Optional: create a **production** environment in GitHub (Settings → Environments)
+to require manual approval before deploy.
+
+**Workflow file:** `.github/workflows/ci-cd.yml`  
+**Remote script:** `scripts/remote-update.sh` (git pull, pip install, restart services)
+
+Manual deploy from your laptop (same as CI):
+
+```bash
+ssh user@VM_IP "bash -s -- /home/user/crypto-trade-bot" < scripts/remote-update.sh
+```
+
+Or trigger **Actions → CI/CD → Run workflow** in GitHub.
+
+### What deploy does
+
+1. `git fetch origin main && git reset --hard origin/main`
+2. Recreate/refreshes `.venv` and `pip install -r requirements.txt`
+3. Restarts `crypto-bot`, and `crypto-dashboard` / `crypto-telegram` if enabled
+
+`.env` and `logs/` on the VM are never touched by CI/CD.
+
+---
+
+## 14) Access live logs from your local machine
+
+Two options while the bot runs on GCP:
+
+### A) Sync log files locally (events, trades, briefings)
+
+1. Copy `scripts/deploy.local.example` → `scripts/.deploy.local` and fill in
+   `GCP_SSH_HOST`, `GCP_SSH_USER`, `GCP_DEPLOY_PATH`.
+2. Pull logs:
+
+**Windows (PowerShell):**
+
+```powershell
+.\scripts\sync-logs.ps1
+.\scripts\sync-logs.ps1 -Tail    # sync + show last 5 lines
+```
+
+**Linux / macOS:**
+
+```bash
+bash scripts/sync-logs.sh
+bash scripts/sync-logs.sh --tail
+```
+
+Files land in `./logs/` — same paths the bot and MCP tools use locally
+(`events.jsonl`, `trades.jsonl`, `briefings.jsonl`, `control.json`).
+
+Use this to inspect live paper/live runs with your editor, run `python -m src.briefing`
+against real data, or point MCP at synced logs.
+
+### B) Dashboard over SSH tunnel (live UI, no public port)
+
+On the VM, run the dashboard bound to localhost only:
+
+```bash
+# in .env on the VM
+DASHBOARD_HOST=127.0.0.1
+DASHBOARD_PORT=8000
+DASHBOARD_DEMO_MODE=false
+```
+
+Enable `crypto-dashboard` systemd (section 10b), then from your laptop:
+
+```powershell
+.\scripts\tunnel-dashboard.ps1
+# open http://127.0.0.1:8000
+```
+
+```bash
+bash scripts/tunnel-dashboard.sh
+```
+
+The dashboard reads the VM's `logs/` in real time; nothing is exposed on the
+public internet.
+
+---
+
 ## Troubleshooting
 
 - **API connection refused / 403:** the VM is in a geo-blocked region. Recreate in a non-US region (see step 1).

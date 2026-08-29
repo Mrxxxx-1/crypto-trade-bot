@@ -322,6 +322,11 @@ logs/
   briefings.jsonl   Full daily briefing history
   briefing_state.json  Last UTC date the in-process daily briefing was sent (optional)
   control.json      Pause/resume state shared across processes (optional)
+scripts/
+  remote-update.sh  VM deploy script (CI/CD + manual)
+  sync-logs.ps1     Pull live logs from GCP to ./logs (Windows)
+  sync-logs.sh      Pull live logs from GCP to ./logs (bash)
+  tunnel-dashboard.*  SSH tunnel to VM dashboard
 data/
   *.json            Cached OHLCV candle data for backtesting
 ```
