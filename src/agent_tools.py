@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import control
+from . import control, log_hygiene
 from .briefing import _read_jsonl, collect_window  # reuse existing log readers
 from .config import Settings
 
@@ -42,12 +42,32 @@ def _tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
     return rows
 
 
-def _latest_event(path: Path, event_name: str) -> dict[str, Any] | None:
+def _latest_event(
+    path: Path,
+    event_name: str,
+    require_key: str | None = None,
+) -> dict[str, Any] | None:
     latest: dict[str, Any] | None = None
     for row in _read_jsonl(path):
-        if row.get("event") == event_name:
-            latest = row
+        if row.get("event") != event_name:
+            continue
+        if require_key is not None and require_key not in row:
+            continue
+        latest = row
     return latest
+
+
+def _latest_snapshot(logs: Path) -> dict[str, Any] | None:
+    """Newest full bot snapshot.
+
+    Routine heartbeats omit ``positions``/``statuses`` (see ``log_hygiene``), so
+    read ``logs/state.json`` first and fall back to the last verbose heartbeat
+    for older log sets such as the committed ``demo_logs/``.
+    """
+    snapshot = log_hygiene.read_state_snapshot(logs)
+    if snapshot:
+        return snapshot
+    return _latest_event(logs / "events.jsonl", "heartbeat", require_key="positions")
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -75,6 +95,7 @@ def get_status(settings: Settings) -> dict[str, Any]:
     logs = _logs_dir(settings)
     events_path = logs / "events.jsonl"
     hb = _latest_event(events_path, "heartbeat")
+    snapshot = _latest_snapshot(logs)
     ctrl = control.read_control(logs)
 
     status: dict[str, Any] = {
@@ -89,12 +110,14 @@ def get_status(settings: Settings) -> dict[str, Any]:
         "last_heartbeat_ts": None,
         "statuses": [],
     }
-    if hb:
-        status["equity"] = hb.get("equity")
-        status["open_positions"] = hb.get("open_positions", 0)
-        status["positions"] = hb.get("positions", [])
-        status["last_heartbeat_ts"] = hb.get("ts")
-        status["statuses"] = hb.get("statuses", [])
+    scalars = hb or snapshot
+    if scalars:
+        status["equity"] = scalars.get("equity")
+        status["open_positions"] = scalars.get("open_positions", 0)
+        status["last_heartbeat_ts"] = scalars.get("ts")
+    if snapshot:
+        status["positions"] = snapshot.get("positions", [])
+        status["statuses"] = snapshot.get("statuses", [])
     return status
 
 
@@ -125,11 +148,11 @@ def get_recent_trades(settings: Settings, limit: int = 10) -> dict[str, Any]:
 
 
 def get_open_positions(settings: Settings) -> dict[str, Any]:
-    """Structured open positions taken from the latest heartbeat snapshot."""
-    hb = _latest_event(_logs_dir(settings) / "events.jsonl", "heartbeat")
-    positions = hb.get("positions", []) if hb else []
+    """Structured open positions taken from the latest snapshot."""
+    snapshot = _latest_snapshot(_logs_dir(settings))
+    positions = snapshot.get("positions", []) if snapshot else []
     return {
-        "as_of": hb.get("ts") if hb else None,
+        "as_of": snapshot.get("ts") if snapshot else None,
         "count": len(positions),
         "positions": positions,
     }

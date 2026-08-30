@@ -11,7 +11,7 @@
 #   bash scripts/sync-logs.sh --force  # overwrite local even if mtime looks newer
 set -euo pipefail
 
-LOG_FILES=(events.jsonl trades.jsonl briefings.jsonl control.json briefing_state.json)
+LOG_FILES=(events.jsonl trades.jsonl briefings.jsonl control.json briefing_state.json state.json)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091

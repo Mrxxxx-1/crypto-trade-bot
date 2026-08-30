@@ -203,6 +203,9 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `POLL_SECONDS` | `30` | Seconds between each polling loop |
 | `LOOKBACK_CANDLES` | `200` | Number of candles fetched for indicator calculation |
 | `HEARTBEAT_INTERVAL` | `5` | Print/log heartbeat every N loops |
+| `LOG_SLIM_HEARTBEAT` | `true` | Omit `positions`/`statuses` from routine heartbeat lines (`logs/state.json` keeps the latest full snapshot) |
+| `LOG_HEARTBEAT_VERBOSE_EVERY` | `20` | Keep one full heartbeat every N heartbeats (changes and risk blocks are always full) |
+| `LOG_ERROR_MAX_CHARS` | `300` | Cap on logged error text; HTML gateway pages collapse to e.g. `502 Bad Gateway` |
 
 ### Position Sizing
 

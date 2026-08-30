@@ -13,7 +13,7 @@ param(
     [switch]$Force
 )
 
-$LogFiles = @("events.jsonl", "trades.jsonl", "briefings.jsonl", "control.json", "briefing_state.json")
+$LogFiles = @("events.jsonl", "trades.jsonl", "briefings.jsonl", "control.json", "briefing_state.json", "state.json")
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)

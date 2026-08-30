@@ -565,7 +565,10 @@ bash scripts/sync-logs.sh --tail
 ```
 
 Files land in `./logs/` — same paths the bot and MCP tools use locally
-(`events.jsonl`, `trades.jsonl`, `briefings.jsonl`, `control.json`).
+(`events.jsonl`, `trades.jsonl`, `briefings.jsonl`, `control.json`, `state.json`).
+
+`state.json` is the latest full position/status snapshot; routine heartbeats in
+`events.jsonl` omit it to keep the file small (see `src/log_hygiene.py`).
 
 Use this to inspect live paper/live runs with your editor, run `python -m src.briefing`
 against real data, or point MCP at synced logs.

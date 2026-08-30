@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict
 
-from . import control
+from . import control, log_hygiene
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
 from .risk import RiskManager
@@ -56,6 +56,9 @@ class FuturesBot:
             self.broker = PaperBroker(settings, self.exchange)
         self.starting_equity = settings.initial_equity
         self.loop_count = 0
+        # Heavy heartbeat fields are logged periodically; logs/state.json always
+        # holds the latest full snapshot for the dashboard / MCP / Telegram layer.
+        self._heartbeat_log = log_hygiene.HeartbeatThinner()
         # Cross-process pause flag (toggled by the Telegram/MCP agent layer).
         # Re-read once per loop in run_forever; only blocks NEW entries/adds.
         self.paused = control.is_paused(settings.logs_dir)
@@ -467,17 +470,19 @@ class FuturesBot:
                     )
                     for status in statuses:
                         print(f"  - {status}")
-                    self.broker.log_event(
-                        "heartbeat",
-                        {
-                            "loop": self.loop_count,
-                            "equity": self.broker.equity,
-                            "open_positions": len(self.broker.positions),
-                            "paused": self.paused,
-                            "positions": self._positions_snapshot(),
-                            "statuses": statuses,
-                        },
+                    snapshot = {
+                        "loop": self.loop_count,
+                        "equity": self.broker.equity,
+                        "open_positions": len(self.broker.positions),
+                        "paused": self.paused,
+                        "positions": self._positions_snapshot(),
+                        "statuses": statuses,
+                    }
+                    log_hygiene.write_state_snapshot(
+                        self.settings.logs_dir,
+                        {"ts": self._utc_now(), "event": "heartbeat", **snapshot},
                     )
+                    self.broker.log_event("heartbeat", self._heartbeat_log.thin(snapshot))
                 time.sleep(self.settings.poll_seconds)
             except KeyboardInterrupt:
                 print("Stopped by user.")

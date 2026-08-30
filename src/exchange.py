@@ -20,6 +20,7 @@ from hyperliquid.exchange import Exchange as HLExchange
 from hyperliquid.info import Info
 from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 
+from . import log_hygiene
 from .config import Settings
 from .models import Leg, PendingOrder, Position, Side, TradeResult
 
@@ -375,7 +376,7 @@ class _BrokerBase:
 
     def log_event(self, event: str, payload: dict) -> None:
         record = {"ts": self._now().isoformat(), "event": event}
-        record.update(payload)
+        record.update(log_hygiene.compact_event_payload(payload))
         self._write_jsonl("events.jsonl", record)
 
     def _entry_fee(self, notional: float) -> float:
