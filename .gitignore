@@ -5,3 +5,11 @@ __pycache__/
 scripts/.deploy.local
 logs/
 data/
+
+# SSH deploy keys. These must stay local: the private key authenticates the
+# GitHub Actions deploy user, which has passwordless `sudo systemctl` on the VM.
+gcp_actions_deploy
+gcp_actions_deploy.pub
+*.pem
+id_ed25519
+id_rsa
