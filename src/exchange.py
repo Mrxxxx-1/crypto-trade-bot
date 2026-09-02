@@ -22,7 +22,7 @@ from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 
 from . import log_hygiene
 from .config import Settings
-from .models import Leg, PendingOrder, Position, Side, TradeResult
+from .models import Leg, Position, Side, TradeResult
 
 T = TypeVar("T")
 
@@ -362,7 +362,6 @@ class _BrokerBase:
         self.exchange = exchange
         self.equity: float = settings.initial_equity
         self.positions: Dict[str, Position] = {}
-        self.pending_orders: Dict[str, PendingOrder] = {}
         self.logs_dir = Path(settings.logs_dir)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -385,130 +384,9 @@ class _BrokerBase:
     def _exit_fee(self, notional: float) -> float:
         return notional * (self.settings.exit_fee_bps / 10_000)
 
-    def cancel_pending(self, symbol: str) -> bool:
-        if symbol in self.pending_orders:
-            del self.pending_orders[symbol]
-            self.log_event("limit_order_cancelled", {"symbol": symbol})
-            return True
-        return False
-
-    def is_pending_expired(self, symbol: str) -> bool:
-        order = self.pending_orders.get(symbol)
-        if not order:
-            return False
-        elapsed = (self._now() - order.placed_at).total_seconds()
-        return elapsed >= self.settings.limit_timeout_seconds
-
 
 class PaperBroker(_BrokerBase):
-    """Simulated execution engine: equity tracking, limit fills, fee/slippage, and JSONL logging."""
-
-    # ------------------------------------------------------------------
-    # Limit entry flow
-    # ------------------------------------------------------------------
-
-    def place_limit_entry(
-        self,
-        symbol: str,
-        side: Side,
-        size: float,
-        limit_price: float,
-        stop_price: float,
-        take_profit_price: float,
-        initial_stop_distance: float = 0.0,
-        trail_atr: float = 0.0,
-    ) -> Optional[PendingOrder]:
-        """Queue a limit entry.  Returns None if size<=0, already positioned, or pending."""
-        if size <= 0 or symbol in self.positions or symbol in self.pending_orders:
-            return None
-        order = PendingOrder(
-            symbol=symbol,
-            side=side,
-            size=size,
-            limit_price=limit_price,
-            stop_price=stop_price,
-            take_profit_price=take_profit_price,
-            placed_at=self._now(),
-            initial_stop_distance=initial_stop_distance,
-            trail_atr=trail_atr,
-        )
-        self.pending_orders[symbol] = order
-        self.log_event(
-            "limit_order_placed",
-            {
-                "symbol": symbol,
-                "side": side,
-                "size": size,
-                "limit_price": limit_price,
-                "stop_price": stop_price,
-                "take_profit_price": take_profit_price,
-            },
-        )
-        return order
-
-    def check_pending_fill(
-        self,
-        symbol: str,
-        known_price: Optional[float] = None,
-    ) -> Optional[Position]:
-        """Check if a pending limit order would fill at current price."""
-        order = self.pending_orders.get(symbol)
-        if not order:
-            return None
-
-        last = (
-            known_price
-            if known_price is not None
-            else self.exchange.fetch_last_price(symbol)
-        )
-        filled = False
-        if order.side == "buy" and last <= order.limit_price:
-            filled = True
-        elif order.side == "sell" and last >= order.limit_price:
-            filled = True
-
-        if not filled:
-            return None
-
-        entry = order.limit_price
-        notional = entry * order.size
-        fee = self._entry_fee(notional)
-        self.equity -= fee
-
-        pos = Position(
-            symbol=symbol,
-            side=order.side,
-            size=order.size,
-            entry_price=entry,
-            stop_price=order.stop_price,
-            take_profit_price=order.take_profit_price,
-            opened_at=self._now(),
-            initial_stop_distance=order.initial_stop_distance,
-            trail_atr=order.trail_atr,
-            peak_price=entry,
-        )
-        self.positions[symbol] = pos
-        del self.pending_orders[symbol]
-
-        self.log_event(
-            "position_open",
-            {
-                "symbol": symbol,
-                "side": order.side,
-                "size": order.size,
-                "entry_price": entry,
-                "stop_price": order.stop_price,
-                "take_profit_price": order.take_profit_price,
-                "fee": fee,
-                "equity": self.equity,
-                "order_type": "limit",
-            },
-        )
-        return pos
-
-    # ------------------------------------------------------------------
-    # DCA leg flow (new strategy entry point)
-    # ------------------------------------------------------------------
+    """Simulated execution engine: equity tracking, fee/slippage, and JSONL logging."""
 
     def open_leg(
         self,
@@ -649,29 +527,12 @@ class PaperBroker(_BrokerBase):
         )
         return trade
 
-    # ------------------------------------------------------------------
-    # Close at exact price level (legacy single-leg exit, kept for compat)
-    # ------------------------------------------------------------------
-
-    def close_position_at(
-        self,
-        symbol: str,
-        exit_at: float,
-        exit_reason: str,
-    ) -> Optional[TradeResult]:
-        """Close position at an exact stop/TP level with slippage applied.
-
-        Deprecated in favour of ``close_all_legs`` under the DCA strategy.
-        Forwards to ``close_all_legs`` so legacy callers keep working.
-        """
-        return self.close_all_legs(symbol, exit_at, exit_reason)
-
 
 class LiveBroker(_BrokerBase):
     """Real execution engine: places orders via ``hyperliquid-python-sdk``.
 
     Same interface as ``PaperBroker`` so ``FuturesBot`` works unchanged.
-    Entry = limit order on the exchange; exit = market order (reduceOnly).
+    Entry and exit are both market orders (exit is reduceOnly).
     Equity is synced from the Hyperliquid account balance.
     """
 
@@ -743,132 +604,6 @@ class LiveBroker(_BrokerBase):
                 f"[reconcile] adopted open {lp['side']} {symbol} "
                 f"size={size} entry={entry} (uPnL={lp['unrealized_pnl']:+.2f})"
             )
-
-    # ------------------------------------------------------------------
-    # Limit entry flow (real orders)
-    # ------------------------------------------------------------------
-
-    def place_limit_entry(
-        self,
-        symbol: str,
-        side: Side,
-        size: float,
-        limit_price: float,
-        stop_price: float,
-        take_profit_price: float,
-        initial_stop_distance: float = 0.0,
-        trail_atr: float = 0.0,
-    ) -> Optional[PendingOrder]:
-        if size <= 0 or symbol in self.positions or symbol in self.pending_orders:
-            return None
-        try:
-            resp = self.exchange.create_limit_order(symbol, side, size, limit_price)
-        except Exception as exc:
-            self.log_event("order_error", {"symbol": symbol, "error": str(exc)})
-            return None
-        order = PendingOrder(
-            symbol=symbol,
-            side=side,
-            size=size,
-            limit_price=limit_price,
-            stop_price=stop_price,
-            take_profit_price=take_profit_price,
-            placed_at=self._now(),
-            initial_stop_distance=initial_stop_distance,
-            trail_atr=trail_atr,
-            exchange_order_id=str(resp.get("id", "")),
-        )
-        self.pending_orders[symbol] = order
-        self.log_event(
-            "limit_order_placed",
-            {
-                "symbol": symbol,
-                "side": side,
-                "size": size,
-                "limit_price": limit_price,
-                "stop_price": stop_price,
-                "take_profit_price": take_profit_price,
-                "exchange_order_id": order.exchange_order_id,
-            },
-        )
-        return order
-
-    def check_pending_fill(
-        self,
-        symbol: str,
-        known_price: Optional[float] = None,
-    ) -> Optional[Position]:
-        order = self.pending_orders.get(symbol)
-        if not order or not order.exchange_order_id:
-            return None
-        try:
-            status = self.exchange.fetch_order(order.exchange_order_id, symbol)
-        except Exception:
-            return None
-        st = status.get("status")
-        if st == "canceled":
-            del self.pending_orders[symbol]
-            self.log_event(
-                "limit_order_gone",
-                {"symbol": symbol, "exchange_order_id": order.exchange_order_id},
-            )
-            return None
-        if st != "closed":
-            return None
-
-        fill_price = float(status.get("average", order.limit_price) or order.limit_price)
-        self._sync_equity()
-
-        pos = Position(
-            symbol=symbol,
-            side=order.side,
-            size=float(status.get("filled", order.size) or order.size),
-            entry_price=fill_price,
-            stop_price=order.stop_price,
-            take_profit_price=order.take_profit_price,
-            opened_at=self._now(),
-            initial_stop_distance=order.initial_stop_distance,
-            trail_atr=order.trail_atr,
-            peak_price=fill_price,
-        )
-        self.positions[symbol] = pos
-        del self.pending_orders[symbol]
-
-        self.log_event(
-            "position_open",
-            {
-                "symbol": symbol,
-                "side": pos.side,
-                "size": pos.size,
-                "entry_price": fill_price,
-                "stop_price": order.stop_price,
-                "take_profit_price": order.take_profit_price,
-                "equity": self.equity,
-                "order_type": "limit",
-                "exchange_order_id": order.exchange_order_id,
-            },
-        )
-        return pos
-
-    def cancel_pending(self, symbol: str) -> bool:
-        order = self.pending_orders.get(symbol)
-        if not order:
-            return False
-        if order.exchange_order_id:
-            try:
-                self.exchange.cancel_order(order.exchange_order_id, symbol)
-            except Exception as exc:
-                self.log_event(
-                    "cancel_error",
-                    {"symbol": symbol, "error": str(exc)},
-                )
-        del self.pending_orders[symbol]
-        self.log_event("limit_order_cancelled", {"symbol": symbol})
-        return True
-
-    # ------------------------------------------------------------------
-    # DCA leg flow (new strategy entry point)
-    # ------------------------------------------------------------------
 
     def open_leg(
         self,
@@ -1008,16 +743,3 @@ class LiveBroker(_BrokerBase):
             },
         )
         return trade
-
-    # ------------------------------------------------------------------
-    # Legacy single-leg exit, kept for back-compat
-    # ------------------------------------------------------------------
-
-    def close_position_at(
-        self,
-        symbol: str,
-        exit_at: float,
-        exit_reason: str,
-    ) -> Optional[TradeResult]:
-        """Deprecated: forwards to ``close_all_legs``."""
-        return self.close_all_legs(symbol, exit_at, exit_reason)

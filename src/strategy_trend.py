@@ -1,6 +1,4 @@
-"""Trend-following strategy (STRATEGY=trend), direction-aware.
-
-A "mature" template that addresses the structural flaws of the DCA dip-buyer:
+"""Trend-following strategy (the only live directional strategy), direction-aware.
 
 * Trade WITH the trend  - enter only when fast EMA > slow EMA AND price is on the
                           right side of the long-term (regime) EMA. Stay flat
@@ -8,22 +6,31 @@ A "mature" template that addresses the structural flaws of the DCA dip-buyer:
 * Asymmetric R:R        - a single ATR-based initial stop, then a wider ATR
                           "chandelier" trailing stop so winners are allowed to
                           run while losers are cut at ~1 risk unit.
-* Risk-based sizing      - size each trade so the stop distance equals a fixed
+* Risk-based sizing     - size each trade so the stop distance equals a fixed
                           fraction (``risk_per_trade_pct``) of equity, capped by
-                          ``max_leverage``. No fixed notional, no DCA averaging.
+                          ``max_leverage``.
 
-One position per symbol, one leg. Long is the default; symbols in
-``SHORT_SYMBOLS`` use the mirror (short above-trend rallies, trail down).
+One position per symbol, one leg. Which side a symbol takes is decided by
+``src/direction.py`` (``DIRECTION_MODE``): either pinned by ``SHORT_SYMBOLS`` or
+read from the trend itself. Every rule below mirrors cleanly for shorts.
 """
 from __future__ import annotations
 
 from typing import List
 
 from .config import Settings
-from .strategy import compute_atr, compute_ema
+from .indicators import LONG, SHORT, compute_atr, compute_ema
 
-LONG = "long"
-SHORT = "short"
+__all__ = [
+    "LONG",
+    "SHORT",
+    "atr_value",
+    "chandelier_stop",
+    "initial_stop",
+    "position_size",
+    "regime_intact",
+    "trend_signal",
+]
 
 
 def _closes(closed_ohlcv: List[List[float]]) -> List[float]:

@@ -1,4 +1,7 @@
-"""Risk controls: position sizing and timer-based trading halts.
+"""Risk controls: timer-based trading halts.
+
+Position *sizing* lives in ``strategy_trend.position_size`` (fixed-fractional off
+the stop distance). This module only decides whether a new trade is allowed.
 
 Two halt triggers:
 - **Consecutive losses** >= ``MAX_CONSECUTIVE_LOSSES`` -> halt for
@@ -78,35 +81,3 @@ class RiskManager:
             self.state.consecutive_losses += 1
         else:
             self.state.consecutive_losses = 0
-
-    def calc_position_size(self, equity: float, entry_price: float, stop_price: float) -> float:
-        """Size = risk_amount / per_unit_risk, capped by max_leverage * equity.
-
-        Deprecated under the DCA strategy (no hard SL).  Retained so external
-        callers / older code paths keep working.  Use ``calc_leg_size`` instead.
-        """
-        risk_amount = equity * (self.settings.risk_per_trade_pct / 100)
-        per_unit_risk = abs(entry_price - stop_price)
-        if per_unit_risk <= 0:
-            return 0.0
-        raw_size = risk_amount / per_unit_risk
-
-        max_notional = equity * self.settings.max_leverage
-        max_size_by_leverage = max_notional / max(entry_price, 1e-9)
-
-        return max(0.0, min(raw_size, max_size_by_leverage))
-
-    def calc_leg_size(self, starting_equity: float, current_price: float) -> float:
-        """DCA leg sizing: each leg = ``leg_notional_pct`` of *starting* equity.
-
-        Using starting equity (not current equity) keeps every leg the same notional
-        regardless of unrealized P/L, which is what "DCA at -X% from last fill"
-        intuitively means.  Still capped at ``max_leverage * starting_equity``
-        worth of size per leg as a sanity guard.
-        """
-        if current_price <= 0 or starting_equity <= 0:
-            return 0.0
-        notional = starting_equity * (self.settings.leg_notional_pct / 100.0)
-        size = notional / current_price
-        max_size = (starting_equity * self.settings.max_leverage) / current_price
-        return max(0.0, min(size, max_size))

@@ -69,7 +69,7 @@ def get_open_positions() -> dict[str, Any]:
 
 @mcp.tool()
 def get_recent_events(limit: int = 20) -> dict[str, Any]:
-    """Recent notable events: opens, DCA adds, trailing-stop exits, errors."""
+    """Recent notable events: opens, trailing-stop exits, errors."""
     return agent_tools.get_recent_events(_settings, limit=limit)
 
 
@@ -83,7 +83,7 @@ def get_last_briefing() -> dict[str, Any]:
 
 @mcp.tool()
 def pause_trading(reason: str = "") -> dict[str, Any]:
-    """Pause NEW entries and DCA adds. Does NOT close or modify open positions."""
+    """Pause NEW entries. Does NOT close or modify open positions."""
     return agent_tools.pause_trading(_settings, reason=reason, by="mcp")
 
 

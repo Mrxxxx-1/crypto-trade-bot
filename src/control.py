@@ -7,7 +7,7 @@ single small JSON file, ``logs/control.json``.
 
 Design rules (important safety boundary):
 
-- ``paused`` only blocks **new** entries and DCA adds.  It NEVER closes,
+- ``paused`` only blocks **new** entries.  It NEVER closes,
   opens, or modifies a position.  The bot's own trailing-stop exit logic keeps
   running while paused so open positions stay protected.
 - Any agent (Telegram / MCP) may toggle this flag, but agents are *only* ever

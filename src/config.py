@@ -2,16 +2,18 @@
 
 ``Settings`` is a frozen dataclass consumed by the bot, exchange, risk, and
 strategy modules.  Defaults are suitable for paper trading on Hyperliquid
-perpetual futures (USDC-margined) under the long-only DCA-on-dips strategy.
+perpetual futures (USDC-margined) under the EMA/ATR trend-following strategy.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import List
 
 from dotenv import load_dotenv
+
+STRATEGIES = ("trend", "hedge")
 
 
 def _as_float(name: str, default: float) -> float:
@@ -28,30 +30,36 @@ def _as_int(name: str, default: int) -> int:
     return int(value)
 
 
-def _parse_price_map(raw: str) -> Dict[str, float]:
-    """Parse ``LONG_MAX_PRICES=BTC:90000,ETH:3000`` into ``{"BTC": 90000, "ETH": 3000}``.
+def _parse_strategy(raw: str) -> str:
+    """Validate ``STRATEGY``; raise on anything unknown.
 
-    Keys match the base of a perp pair like ``BTC/USDC:USDC`` (the part before ``/``).
-    Empty / missing entries are skipped silently; malformed entries raise ValueError so
-    the user notices typos immediately at startup.
+    The retired ``dca`` value gets a specific message, since an old ``.env``
+    carried over from a previous deploy would otherwise fail cryptically.
     """
-    if not raw:
-        return {}
-    out: Dict[str, float] = {}
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if ":" not in chunk:
-            raise ValueError(
-                f"LONG_MAX_PRICES entry '{chunk}' missing ':' (expected BASE:PRICE, e.g. BTC:90000)"
-            )
-        base, price = chunk.split(":", 1)
-        base = base.strip().upper()
-        if not base:
-            continue
-        out[base] = float(price.strip())
-    return out
+    name = (raw or "trend").strip().lower() or "trend"
+    if name == "dca":
+        raise ValueError(
+            "STRATEGY=dca has been removed. Use STRATEGY=trend (directional "
+            "trading) or STRATEGY=hedge (manual catalyst hedge only)."
+        )
+    if name not in STRATEGIES:
+        raise ValueError(f"STRATEGY must be one of {STRATEGIES}, got '{raw}'")
+    return name
+
+
+def _parse_direction_mode(raw: str) -> str:
+    """Validate ``DIRECTION_MODE``; raise on typos so they surface at startup.
+
+    A silent fallback here would be dangerous: mistyping ``signal`` would leave
+    the bot pinned to ``SHORT_SYMBOLS`` while the operator believed direction
+    was being read from the trend.
+    """
+    mode = (raw or "static").strip().lower()
+    if mode not in ("static", "signal"):
+        raise ValueError(
+            f"DIRECTION_MODE must be 'static' or 'signal', got '{raw}'"
+        )
+    return mode
 
 
 @dataclass(frozen=True)
@@ -62,8 +70,8 @@ class Settings:
     testnet: bool
 
     symbols: List[str]
-    short_symbols: List[str]           # base coins traded short-only (e.g. ["TRUMP", "HYPE"])
-    strategy: str                      # "dca" (dip-buying) or "trend" (EMA/ATR trend-following)
+    short_symbols: List[str]           # base coins pinned short under DIRECTION_MODE=static
+    strategy: str                      # "trend" or "hedge" (manual catalyst hedge only)
     timeframe: str
     poll_seconds: int
     lookback_candles: int
@@ -73,27 +81,12 @@ class Settings:
     max_daily_loss_pct: float
     max_consecutive_losses: int
 
-    # --- DCA-on-dips strategy parameters (active) ---
-    long_max_prices: Dict[str, float]  # per-symbol price ceiling for entries
-    initial_dip_pct: float             # % drop from recent high to trigger first leg
-    high_lookback_candles: int         # window for "recent high" (e.g. 96 = 24h at 15m)
-    dip_memory_bars: int               # how many recent closed bars to scan for a qualifying dip
-    require_green_confirmation: bool   # if True, only enter when latest closed bar is green (close > open)
-    dca_trigger_pct: float             # % drop from last fill price to add a leg
-    leg_notional_pct: float            # % of starting equity per leg (notional)
-    max_dca_legs: int                  # hard cap on legs per symbol
-    trail_activate_pct: float          # arm trailing once price >= avg_cost * (1 + this/100)
-    trail_distance_pct: float          # once armed, exit if price <= peak * (1 - this/100)
-    stop_loss_pct: float               # hard stop: exit all legs if price <= avg_cost * (1 - this/100); 0 disables
-    take_profit_pct: float             # fixed TP: exit all legs if price >= avg_cost * (1 + this/100); 0 disables
-    trend_filter_enabled: bool         # only enter/add when price is above the long EMA (skip downtrends)
-    trend_ema_period: int              # EMA period for the trend filter
-
     # --- Trend-following strategy parameters (STRATEGY=trend) ---
-    # EMA cross + 200-EMA regime filter, ATR initial stop, ATR chandelier trail,
-    # fixed-fractional (risk %) position sizing. trend_ema_period (above) is the
-    # regime EMA shared with the DCA trend filter.
+    # EMA cross + regime EMA filter, ATR initial stop, ATR chandelier trail,
+    # fixed-fractional (risk %) position sizing.
+    trend_ema_period: int              # regime EMA: price must be on its favorable side
     risk_per_trade_pct: float          # % of equity risked per trade (stop distance = risk)
+    direction_mode: str                # "static" (SHORT_SYMBOLS decides) or "signal" (trend decides)
     fast_ema: int                      # fast EMA for the trend cross
     slow_ema: int                      # slow EMA for the trend cross
     atr_period: int                    # ATR lookback for stops/sizing
@@ -108,16 +101,6 @@ class Settings:
     mtf_enabled: bool                  # require higher-timeframe trend alignment for entries
     mtf_timeframe: str                 # higher timeframe (e.g. "4h") for the MTF filter
     mtf_ema_period: int                # EMA period on the higher timeframe
-    dca_chandelier_enabled: bool       # use an ATR chandelier trail for the DCA exit instead of % trail
-
-    # --- Deprecated knobs; retained so old .env files don't crash ---
-    atr_min_pct: float
-    take_profit_r: float
-    cooldown_candles: int
-    post_stop_candles: int
-    htf_timeframe: str
-    stop_atr_source: str
-    trail_after_r: float
 
     consec_halt_hours: float
     daily_loss_halt_hours: float
@@ -125,7 +108,6 @@ class Settings:
     entry_fee_bps: float
     exit_fee_bps: float
     slippage_bps: float
-    limit_timeout_seconds: int
     heartbeat_interval: int
     logs_dir: str
 
@@ -182,16 +164,12 @@ class Settings:
         """A hedge needs a funded sub-account address to hold the short leg."""
         return bool(self.hedge_enabled and self.hedge_sub_account.strip())
 
-    def max_price_for(self, symbol: str) -> float:
-        """Return the long-entry price ceiling for ``symbol``; +inf if uncapped."""
-        base = symbol.split("/")[0].strip().upper() if "/" in symbol else symbol.strip().upper()
-        return self.long_max_prices.get(base, float("inf"))
-
     def direction_for(self, symbol: str) -> str:
         """Return ``"short"`` if the symbol's base is in ``short_symbols``, else ``"long"``.
 
-        The strategy is long-only by default; only symbols explicitly listed in
-        ``SHORT_SYMBOLS`` are traded short (mirror logic).
+        Only consulted under ``DIRECTION_MODE=static``, where a symbol is pinned
+        to one side for the life of the process. Under ``signal`` the trend
+        decides instead -- see ``src/direction.py``.
         """
         base = symbol.split("/")[0].strip().upper() if "/" in symbol else symbol.strip().upper()
         return "short" if base in self.short_symbols else "long"
@@ -219,7 +197,7 @@ def load_settings() -> Settings:
         testnet=os.getenv("HL_TESTNET", "").lower() in ("1", "true", "yes"),
         symbols=symbols,
         short_symbols=short_symbols,
-        strategy=os.getenv("STRATEGY", "dca").strip().lower() or "dca",
+        strategy=_parse_strategy(os.getenv("STRATEGY", "trend")),
         timeframe=os.getenv("TIMEFRAME", "15m"),
         poll_seconds=_as_int("POLL_SECONDS", 30),
         lookback_candles=_as_int("LOOKBACK_CANDLES", 200),
@@ -228,30 +206,13 @@ def load_settings() -> Settings:
         max_daily_loss_pct=_as_float("MAX_DAILY_LOSS_PCT", 2.0),
         max_consecutive_losses=_as_int("MAX_CONSECUTIVE_LOSSES", 3),
 
-        # DCA strategy (active)
-        long_max_prices=_parse_price_map(os.getenv("LONG_MAX_PRICES", "BTC:90000,ETH:3000")),
-        initial_dip_pct=_as_float("INITIAL_DIP_PCT", 3.0),
-        high_lookback_candles=_as_int("HIGH_LOOKBACK_CANDLES", 96),
-        dip_memory_bars=_as_int("DIP_MEMORY_BARS", 6),
-        require_green_confirmation=os.getenv("REQUIRE_GREEN_CONFIRMATION", "true").lower()
-        in ("1", "true", "yes"),
-        dca_trigger_pct=_as_float("DCA_TRIGGER_PCT", 10.0),
-        leg_notional_pct=_as_float("LEG_NOTIONAL_PCT", 10.0),
-        max_dca_legs=_as_int("MAX_DCA_LEGS", 5),
-        trail_activate_pct=_as_float("TRAIL_ACTIVATE_PCT", 5.0),
-        trail_distance_pct=_as_float("TRAIL_DISTANCE_PCT", 3.0),
-        stop_loss_pct=_as_float("STOP_LOSS_PCT", 0.0),
-        take_profit_pct=_as_float("TAKE_PROFIT_PCT", 0.0),
-        trend_filter_enabled=os.getenv("TREND_FILTER_ENABLED", "true").lower()
-        in ("1", "true", "yes"),
+        # Trend-following strategy
         trend_ema_period=_as_int("TREND_EMA_PERIOD", 200),
-
-        # Deprecated knobs (kept for back-compat with old .env files)
         risk_per_trade_pct=_as_float("RISK_PER_TRADE_PCT", 0.5),
+        direction_mode=_parse_direction_mode(os.getenv("DIRECTION_MODE", "static")),
         fast_ema=_as_int("FAST_EMA", 9),
         slow_ema=_as_int("SLOW_EMA", 21),
         atr_period=_as_int("ATR_PERIOD", 14),
-        atr_min_pct=_as_float("ATR_MIN_PCT", 0.15),
         stop_atr_multiplier=_as_float("STOP_ATR_MULTIPLIER", 2.5),
         trail_atr_multiplier=_as_float("TRAIL_ATR_MULTIPLIER", 2.0),
 
@@ -263,23 +224,12 @@ def load_settings() -> Settings:
         mtf_enabled=os.getenv("MTF_ENABLED", "").lower() in ("1", "true", "yes"),
         mtf_timeframe=os.getenv("MTF_TIMEFRAME", "4h").strip() or "4h",
         mtf_ema_period=_as_int("MTF_EMA_PERIOD", 50),
-        dca_chandelier_enabled=os.getenv("DCA_CHANDELIER_ENABLED", "").lower()
-        in ("1", "true", "yes"),
-
-        # Deprecated knobs (kept for back-compat with old .env files)
-        take_profit_r=_as_float("TAKE_PROFIT_R", 2.0),
-        cooldown_candles=_as_int("COOLDOWN_CANDLES", 0),
-        post_stop_candles=_as_int("POST_STOP_CANDLES", 1),
-        htf_timeframe=os.getenv("HTF_TIMEFRAME", "1h"),
-        stop_atr_source=os.getenv("STOP_ATR_SOURCE", "htf"),
-        trail_after_r=_as_float("TRAIL_AFTER_R", 0.0),
 
         consec_halt_hours=_as_float("CONSEC_HALT_HOURS", 6),
         daily_loss_halt_hours=_as_float("DAILY_LOSS_HALT_HOURS", 12),
         entry_fee_bps=_as_float("ENTRY_FEE_BPS", 2),
         exit_fee_bps=_as_float("EXIT_FEE_BPS", 3.5),
         slippage_bps=_as_float("SLIPPAGE_BPS", 2),
-        limit_timeout_seconds=_as_int("LIMIT_TIMEOUT_SECONDS", 30),
         heartbeat_interval=max(1, _as_int("HEARTBEAT_INTERVAL", 5)),
         logs_dir=os.getenv("LOGS_DIR", "logs").strip() or "logs",
         daily_briefing_enabled=os.getenv("DAILY_BRIEFING_ENABLED", "").lower()

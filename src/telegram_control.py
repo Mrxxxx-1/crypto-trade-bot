@@ -94,10 +94,20 @@ def _fmt_status(s: dict[str, Any]) -> str:
         lines.append(f"Pause reason: {s['pause_reason']}")
     for p in s.get("positions", []):
         lines.append(
-            f"  • {p['symbol']} legs={p['legs']}/{p['max_legs']} "
-            f"avg={p['avg_entry']} trail={'armed@'+str(p['stop_price']) if p['trail_armed'] else 'off'}"
+            f"  • {p['symbol']} {_side_label(p)} "
+            f"avg={p['avg_entry']} {_stop_label(p)}"
         )
     return "\n".join(lines)
+
+
+def _side_label(p: dict[str, Any]) -> str:
+    return "short" if str(p.get("side")) == "sell" else "long"
+
+
+def _stop_label(p: dict[str, Any]) -> str:
+    """Render the trailing stop, tolerating a snapshot that predates the field."""
+    stop = p.get("stop_price") or 0
+    return f"stop={stop}" if stop else "stop=none"
 
 
 def _fmt_pnl(d: dict[str, Any]) -> str:
@@ -133,9 +143,8 @@ def _fmt_positions(d: dict[str, Any]) -> str:
     out = ["Open positions:"]
     for p in rows:
         out.append(
-            f"  {p['symbol']} legs={p['legs']}/{p['max_legs']} "
-            f"size={p['size']} avg={p['avg_entry']} "
-            f"trail={'armed@'+str(p['stop_price']) if p['trail_armed'] else 'off'}"
+            f"  {p['symbol']} {_side_label(p)} "
+            f"size={p['size']} avg={p['avg_entry']} {_stop_label(p)}"
         )
     return "\n".join(out)
 

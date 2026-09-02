@@ -16,10 +16,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import agent_tools, hedge  # noqa: E402
-from src.hedge import CLOSED, CUT, EXPIRED, FAILED, LONG, OPEN, REQUESTED, SHORT  # noqa: E402
+from src.hedge import (  # noqa: E402
+    CLOSED,
+    CUT,
+    EXPIRED,
+    FAILED,
+    LONG,
+    OPEN,
+    REQUESTED,
+    SHORT,
+)
 from src.hedge_broker import MAIN, SUB, HedgeManager  # noqa: E402
 from src.telegram_control import _handle_hedge  # noqa: E402
-from tests.test_straddle import make_settings  # noqa: E402
+from tests.helpers import make_settings  # noqa: E402
 
 SYMBOL = "BTC/USDC:USDC"
 

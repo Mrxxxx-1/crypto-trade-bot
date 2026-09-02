@@ -108,14 +108,15 @@ it to perps (UI, or the SDK's `usd_class_transfer`) or the bot will size to 0.
 
 #### Strategy & direction
 
-- `STRATEGY=trend` (EMA/ATR trend-follower, recommended on `TIMEFRAME=4h`) or `dca`
-- `SHORT_SYMBOLS=` controls direction per symbol: bases listed here trade
-  **short-only** (mirror logic), everything else is **long-only**. A long-only
-  bot stays flat in a downtrend; add symbols here to trade the short side.
-- Opt-in entry filters (off by default): `ADX_MIN` (chop filter, trend),
+- `STRATEGY=trend` (EMA/ATR trend-follower, recommended on `TIMEFRAME=4h`) or
+  `hedge` (manual catalyst hedge only, no directional trading)
+- `DIRECTION_MODE=static` uses `SHORT_SYMBOLS` to pin each symbol to one side:
+  bases listed there trade **short-only** (mirror logic), everything else is
+  **long-only**. A long-only bot stays flat in a downtrend. `DIRECTION_MODE=signal`
+  instead lets the trend pick the side per bar and ignores `SHORT_SYMBOLS`.
+- Opt-in entry filters (off by default): `ADX_MIN` (chop filter),
   `VOLUME_MIN_MULT` (volume confirmation), `MTF_ENABLED` (higher-timeframe
-  alignment), `DCA_CHANDELIER_ENABLED`. See the README "Entry-quality filters"
-  table for details.
+  alignment). See the README "Entry-quality filters" table for details.
 
 > **Startup reconciliation:** on launch the live bot adopts any open positions
 > already on the account and manages them with the active strategy — including

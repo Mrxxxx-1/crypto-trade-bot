@@ -26,7 +26,6 @@ from . import control, log_hygiene
 from .briefing import _read_jsonl, collect_window  # reuse existing log readers
 from .config import Settings
 
-
 # ---------------------------------------------------------------------------
 # Low-level log helpers
 # ---------------------------------------------------------------------------
@@ -186,7 +185,7 @@ def get_last_briefing(settings: Settings) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def pause_trading(settings: Settings, reason: str = "", by: str = "agent") -> dict[str, Any]:
-    """Block new entries and DCA adds. Does NOT close or modify open positions."""
+    """Block new entries. Does NOT close or modify open positions."""
     rec = control.set_paused(_logs_dir(settings), True, reason=reason, by=by)
     return {"ok": True, "action": "pause", **rec}
 
@@ -226,7 +225,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "get_recent_events": {
         "fn": get_recent_events,
         "params": {"limit": "int (how many recent events, default 20)"},
-        "description": "Recent notable events: position opens, DCA adds, trailing-stop exits, errors.",
+        "description": "Recent notable events: position opens, trailing-stop exits, errors.",
     },
     "get_last_briefing": {
         "fn": get_last_briefing,
@@ -236,7 +235,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "pause_trading": {
         "fn": pause_trading,
         "params": {"reason": "str (optional note explaining why)"},
-        "description": "Pause NEW trades and DCA adds. Open positions are NOT closed. Use to stop the bot entering new positions.",
+        "description": "Pause NEW trades. Open positions are NOT closed. Use to stop the bot entering new positions.",
     },
     "resume_trading": {
         "fn": resume_trading,

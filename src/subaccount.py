@@ -229,11 +229,31 @@ def preflight(settings: Settings) -> dict[str, Any]:
 
     configured_sub = settings.hedge_sub_account.strip().lower()
     known = {str(s.get("subAccountUser", "")).lower() for s in sub_list if isinstance(s, dict)}
+    agents = snapshot.get("approved_agents")
+    agent_addrs = {
+        str(a.get("address", "")).lower()
+        for a in (agents if isinstance(agents, list) else [])
+        if isinstance(a, dict)
+    }
+    configured_ok = bool(configured_sub) and (not known or configured_sub in known)
+    sub_fix = "Set HEDGE_SUB_ACCOUNT to one of the sub-account addresses listed by `status`."
+    if configured_sub and configured_sub in agent_addrs:
+        names = [
+            str(a.get("name") or a.get("address"))
+            for a in agents
+            if isinstance(a, dict) and str(a.get("address", "")).lower() == configured_sub
+        ]
+        label = names[0] if names else configured_sub
+        sub_fix = (
+            f"HEDGE_SUB_ACCOUNT is set to the API wallet ({label}), not the sub-account. "
+            "Put the sub-account address from the UI (Portfolio -> Sub-Accounts) in "
+            "HEDGE_SUB_ACCOUNT, and keep the API wallet's private key in HEDGE_SUB_PRIVATE_KEY."
+        )
     check(
         "sub_account_configured",
-        bool(configured_sub) and (not known or configured_sub in known),
+        configured_ok,
         detail=f"HEDGE_SUB_ACCOUNT={settings.hedge_sub_account or '(unset)'}",
-        fix="Set HEDGE_SUB_ACCOUNT to one of the sub-account addresses listed by `status`.",
+        fix=sub_fix,
     )
 
     sub_equity = snapshot.get("sub_equity")

@@ -8,52 +8,109 @@ open, close, or modify a position.
 
 ## Strategies
 
-The bot ships with two interchangeable, **direction-aware** strategies, selected
-by `STRATEGY` in `.env`. A symbol listed in `SHORT_SYMBOLS` trades the mirror
-(short) logic; everything else is long.
+`STRATEGY` in `.env` selects between one directional strategy and a manual
+hedge-only mode:
 
-### `STRATEGY=dca` — dip-buying DCA (mean-reversion)
+| `STRATEGY` | What it does |
+|-----------|--------------|
+| `trend` (default) | EMA/ATR trend-following, described below. The only strategy that trades on its own. |
+| `hedge` | Trades nothing. Services only the [manual catalyst hedge](#catalyst-hedge-manual-and-opt-in). |
 
-| Step | Detail |
-|------|--------|
-| Entry (long) | Open the first leg when a recent bar dipped ≥ `INITIAL_DIP_PCT` below the local high, confirmed by a green bar; gated by the EMA trend filter and per-symbol price cap. |
-| DCA add | Add a leg when price falls a further `DCA_TRIGGER_PCT` below the last fill (up to `MAX_DCA_LEGS`). |
-| Exit | Percent trailing stop (`TRAIL_ACTIVATE_PCT` to arm, `TRAIL_DISTANCE_PCT` to trail), plus optional hard `STOP_LOSS_PCT` and `TAKE_PROFIT_PCT`. |
-| Trend filter | When `TREND_FILTER_ENABLED`, only trade with price on the right side of the `TREND_EMA_PERIOD` EMA. |
+A symbol listed in `SHORT_SYMBOLS` trades the mirror (short) logic; everything
+else is long. You can instead set
+[`DIRECTION_MODE=signal`](#choosing-a-direction-direction_mode) to let the trend
+choose the side per bar rather than pinning it per symbol.
 
-### `STRATEGY=trend` — EMA/ATR trend-following (recommended)
+> A previous dip-buying DCA strategy (`STRATEGY=dca`) has been removed. An old
+> `.env` still carrying `STRATEGY=dca` fails at startup with a message pointing
+> here rather than silently trading something unintended.
+
+### `STRATEGY=trend` — EMA/ATR trend-following
 
 | Step | Detail |
 |------|--------|
 | Entry (long) | `FAST_EMA` > `SLOW_EMA` **and** price > `TREND_EMA_PERIOD` (regime) EMA. |
-| Initial stop | `STOP_ATR_MULTIPLIER` × ATR from entry. |
-| Trailing stop | ATR "chandelier": `TRAIL_ATR_MULTIPLIER` × ATR from the favorable extreme (wide = let winners run). |
+| Entry (short) | The exact mirror: `FAST_EMA` < `SLOW_EMA` **and** price < the regime EMA. |
+| Initial stop | `STOP_ATR_MULTIPLIER` × ATR from entry — below for longs, above for shorts. |
+| Trailing stop | ATR "chandelier": `TRAIL_ATR_MULTIPLIER` × ATR from the favorable extreme (highest high for longs, lowest low for shorts; wide = let winners run). |
 | Soft exit | Close when the fast/slow EMA cross flips against the position. |
 | Sizing | Fixed-fractional: risk `RISK_PER_TRADE_PCT` of equity per trade (size = risk ÷ stop distance), capped by `MAX_LEVERAGE`. |
+
+#### Choosing a direction: `DIRECTION_MODE`
+
+By default (`DIRECTION_MODE=static`) `config.direction_for()` pins each symbol to one
+direction for the life of the process: short if its base coin is in `SHORT_SYMBOLS`, long
+otherwise. A symbol never flips. With `SHORT_SYMBOLS=BTC,ETH` the bot will *only* ever
+short BTC and ETH — a bullish EMA cross produces no trade at all, just a
+`no_entry(short) no_trend` heartbeat. Setting every symbol you trade to short is therefore
+a directional bet on the whole book, and it bleeds through a rally.
+
+`DIRECTION_MODE=signal` instead asks the strategy which way the trend points and trades
+that side, ignoring `SHORT_SYMBOLS`. Because the long and short rules are strict mirrors,
+at most one can fire; when neither does, the bot stands aside as before.
+
+| `STRATEGY=trend`, 22mo 4h BTC/ETH | Net P&L | Return | Profit factor | Max DD | Trades | Fees |
+|------|---------|--------|------|--------|--------|------|
+| `static`, `SHORT_SYMBOLS=BTC,ETH` | +$1,752 | +17.5% | 1.35 | 11.2% | 118 | $167 |
+| `static`, `SHORT_SYMBOLS=` (long-only) | +$2,727 | +27.3% | 1.58 | 13.0% | 109 | $191 |
+| `signal` | **+$5,187** | **+51.9%** | 1.50 | 14.6% | 226 | $387 |
+
+Reproduce with `python -m src.backtest --set STRATEGY=trend TIMEFRAME=4h DIRECTION_MODE=signal`.
+
+Signal mode roughly doubles the trade count, since both sides of every symbol become
+tradeable — and doubles the fees with it. The extra return is not free: max drawdown rises
+to 14.6% and the worst losing streak grows to 10 trades. It is still trend-following, so
+the P&L is concentrated: 10 profitable months against 13 losing ones, and removing the
+four best months turns the whole run negative.
+
+Two safety notes:
+
+- **An open position never flips.** Direction is recovered from the position's own `side`
+  while it is open, in both modes. Re-resolving mid-trade would invert every stop and
+  trail comparison and turn a protective stop into a target. `tests/test_direction.py`
+  guards this.
+- **A typo raises at startup** rather than falling back, so a mistyped `signal` can't
+  silently leave you pinned to `SHORT_SYMBOLS`.
+
+A typo in `DIRECTION_MODE` raises at startup rather than falling back, so a mistyped
+`signal` can't silently leave you pinned to `SHORT_SYMBOLS`.
+
+To see which side each symbol would take right now, and which gate is holding an entry
+back, run the preflight against your cached candles:
+
+```bash
+python scripts/check-direction.py                # uses .env
+python scripts/check-direction.py --mode static  # compare, without editing .env
+```
+
+```
+BTC/USDC:USDC   last=77,910.00
+   long signal : True
+   short signal: False
+   -> direction: long   (static mode would say short)
+   atr=872.21  stop=75,293.36  size=0.0038  notional=$297.75
+   NO ENTRY - blocked by: ADX >= 25.0 (is 12.3)
+```
 
 Backtest (22 months, 4h BTC/ETH, `STRATEGY=trend`): **+11.7%** return, **1.27**
 profit factor, **16.4%** max drawdown — a ~35% win rate with average win ≈ 2.4×
 average loss. Backtested, not live; figures depend on the window and parameters.
 
-### Dual-leg straddle (research only, not a `STRATEGY=` value)
-
-A simulator that opens a mirrored long and short on one symbol and cuts the loser once a
-trend declares itself. It is not selectable in the live bot — Hyperliquid nets to one
-position per coin. See [4b. Straddle backtest](#4b-straddle-backtest-research-only).
-
 ### Entry-quality filters (opt-in)
 
-Four filters can tighten entries on top of either strategy. **All are disabled by
-default**, so the backtested figures above and existing behaviour are unchanged
-until you turn one on. They live in the shared strategy functions, so the live
-bot and the backtester apply them identically.
+Three filters can tighten entries. **All are disabled by default**, so the
+backtested figures above and existing behaviour are unchanged until you turn one
+on. They live in `src/indicators.py`, shared by the live bot and the backtester,
+so both apply them identically.
 
-| Filter | Knob(s) | Rule | Applies to |
-|--------|---------|------|------------|
-| **ADX chop filter** | `ADX_MIN` (0=off), `ADX_PERIOD` | Skip entries unless Wilder ADX ≥ `ADX_MIN` (e.g. 25) — stand aside in ranging markets | `trend` only |
-| **Volume confirmation** | `VOLUME_MIN_MULT` (0=off), `VOLUME_MA_PERIOD` | Entry bar volume must exceed `VOLUME_MIN_MULT` × the volume average (e.g. 1.5×) | both |
-| **MTF alignment** | `MTF_ENABLED`, `MTF_TIMEFRAME`, `MTF_EMA_PERIOD` | Longs only when the higher timeframe closes above its EMA (mirror for shorts) | both |
-| **DCA chandelier** | `DCA_CHANDELIER_ENABLED` | Use an ATR chandelier trail (`TRAIL_ATR_MULTIPLIER` × ATR from the extreme) for the DCA exit instead of the percent trail | `dca` only |
+| Filter | Knob(s) | Rule |
+|--------|---------|------|
+| **ADX chop filter** | `ADX_MIN` (0=off), `ADX_PERIOD` | Skip entries unless Wilder ADX ≥ `ADX_MIN` (e.g. 25) — stand aside in ranging markets |
+| **Volume confirmation** | `VOLUME_MIN_MULT` (0=off), `VOLUME_MA_PERIOD` | Entry bar volume must exceed `VOLUME_MIN_MULT` × the volume average (e.g. 1.5×) |
+| **MTF alignment** | `MTF_ENABLED`, `MTF_TIMEFRAME`, `MTF_EMA_PERIOD` | Longs only when the higher timeframe closes above its EMA (mirror for shorts) |
+
+Each gate returns "allowed" when its knob is off, and "blocked" when there isn't
+enough history to decide — a cold start never enters on thin data.
 
 Backtesting the MTF filter needs cached higher-timeframe candles too:
 `python -m src.fetch_candles --timeframes 4h`. The backtester errors with a clear
@@ -71,7 +128,7 @@ candles on subsequent ticks.
 
 | Guard | Trigger | Action |
 |-------|---------|--------|
-| Per-trade sizing | strategy sizing (DCA leg notional or trend risk %) | Caps position size |
+| Per-trade sizing | Risk `RISK_PER_TRADE_PCT` of equity per trade | Caps position size |
 | Max leverage | Notional > `MAX_LEVERAGE` x equity | Caps position size |
 | Consecutive losses | Streak >= `MAX_CONSECUTIVE_LOSSES` | Halt all trading for `CONSEC_HALT_HOURS` |
 | Rolling drawdown | Drawdown from window start >= `MAX_DAILY_LOSS_PCT` | Halt all trading for `DAILY_LOSS_HALT_HOURS` |
@@ -109,67 +166,13 @@ This downloads OHLCV candles to `data/` for the configured timeframe(s) used by 
 
 ```powershell
 python -m src.backtest --env .env
-python -m src.backtest --env .env --set STRATEGY=trend TIMEFRAME=4h LOOKBACK_CANDLES=400
-python -m src.backtest --env .env --set STRATEGY=dca STOP_LOSS_PCT=30 TAKE_PROFIT_PCT=20
+python -m src.backtest --env .env --set TIMEFRAME=4h LOOKBACK_CANDLES=400
+python -m src.backtest --env .env --label SIGNAL --set DIRECTION_MODE=signal
 ```
 
-### 4b. Straddle backtest (research only)
-
-`python -m src.backtest_straddle` simulates a **dual-leg straddle**: open a long and a
-short on the same symbol at the same time with identical size and identical ATR stop
-distance, wait for a trigger to declare which way the market is going, close the losing
-leg, and let the winner ride the usual chandelier trail.
-
-This is **simulation only and is not wired into the live bot**. Hyperliquid holds one net
-position per coin, so two opposing legs in one account would simply cancel out; running it
-live would need a second sub-account.
-
-```powershell
-python -m src.fetch_candles --timeframes 4h --days 730
-python -m src.backtest_straddle --env .env --compare
-python -m src.backtest_straddle --env .env --entry-mode chop --compare
-python -m src.backtest_straddle --env .env --trigger atr --trigger-atr-mult 1.5
-python -m src.backtest_straddle --env .env --trigger range --range-lookback 20
-```
-
-Use `--env .env` (not the `.env.example` default) so the run uses your live trend
-parameters. `--compare` runs the ordinary trend backtest over the identical candles and
-prints a head-to-head table.
-
-| Flag | Values | Meaning |
-| --- | --- | --- |
-| `--entry-mode` | `always` (default), `chop`, `squeeze` | When to open a pair. `chop` is the exact inverse of the live `ADX_MIN` filter: straddle only where the directional strategy would stay out. `squeeze` requires volatility compression (see below). |
-| `--trigger` | `trend_signal` (default), `atr`, `range` | Which rule declares the winning leg. |
-| `--trigger-atr-mult` | float, default `1.0` | `atr` trigger: cut the leg that is this many ATRs offside from the pair entry. |
-| `--range-lookback` | int, default `20` | `range` trigger: cut when price breaks the high/low of the last N bars. |
-| `--compare` | flag | Also run the baseline trend strategy and print the delta. |
-| `--set KEY=VALUE` | | Same override syntax as `src.backtest`. |
-
-**Volatility compression (`--entry-mode squeeze`)** uses `src/strategy_squeeze.py`, which
-ranks current volatility against the symbol's own recent history so thresholds are
-scale-free across BTC and ETH:
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--squeeze-lookback` | `120` | Bars the percentiles rank against. |
-| `--squeeze-atr-pct` | `20` | Max ATR percentile to count as compressed; `0` disables. |
-| `--squeeze-bbw-pct` | `20` | Max Bollinger-width percentile; `0` disables. |
-| `--squeeze-nr` | `0` | Also require the narrowest bar range of the last N bars. |
-| `--squeeze-combine` | `all` | Require every enabled check, or `any` one of them. |
-
-> **Measured result:** squeeze-gated entry *loses* money on BTC/ETH 4h (profit factor
-> 0.98–1.10 across thresholds, versus 1.45 for the baseline). The cause is visible in the
-> pair economics: entering while ATR is in its calmest 20% means the ATR stop and the
-> 6×ATR chandelier are tiny in absolute terms, so the expansion whipsaws *both* legs out.
-> Average winner leg falls to +$1.19 (versus +$4.88 for `--entry-mode chop`) while losers
-> stay the same size. Volatility compression is a bad time to size off ATR.
-
-On top of the standard trade report it prints pair economics: pairs opened, how each was
-resolved, average winner and loser legs, and the **loser-leg fee drag** — the extra round
-trip the pair pays versus a single directional entry. `tests/test_straddle.py` proves the
-identity behind that line: a straddle cycle equals a single entry at the cut price minus
-exactly those extra fees, so the pair mechanic itself adds no edge. Any improvement in the
-report comes from the *entry rule*, not from holding both sides.
+Use `--env .env` (not the `.env.example` default) so the run uses your live
+parameters. `--set` accepts any setting name; comma-separated lists such as
+`SYMBOLS` and `SHORT_SYMBOLS` are parsed as lists.
 
 ### 5. Run the bot
 
@@ -225,7 +228,7 @@ Or set `TELEGRAM_CONTROL_ENABLED=true` to run it inside `python -m src.main`. Co
 
 A **hedge** opens a mirrored long and short on one coin before a scheduled event (CPI, FOMC, an ETF decision). Whichever stop the market reaches first identifies the losing leg: it is cut for a capped loss, and the survivor trails.
 
-> **Read this before enabling it.** A hedge cannot generate profit on its own. The loser's realized loss always equals the winner's unrealized gain at the moment of the cut, in every price path, so the pair is exactly equivalent to a single position entered at the cut price — minus an extra round trip in fees. Its one real benefit is that the survivor's cost basis is fixed the instant the hedge opens, so a violent catalyst gap cannot slip your entry. That is worth a few bps for a known event and nothing at all as a daily strategy: `--entry-mode squeeze` in the straddle backtest measures the automated version and its profit factor drops below 1.
+> **Read this before enabling it.** A hedge cannot generate profit on its own. The loser's realized loss always equals the winner's unrealized gain at the moment of the cut, in every price path, so the pair is exactly equivalent to a single position entered at the cut price — minus an extra round trip in fees. Its one real benefit is that the survivor's cost basis is fixed the instant the hedge opens, so a violent catalyst gap cannot slip your entry. That is worth a few bps for a known event and nothing at all as a daily strategy: backtesting the automated version (arming on volatility compression) dropped profit factor below 1, which is why entry is manual.
 
 **Setup.** Hyperliquid holds one net position per coin, so the two legs need two accounts. Sub-accounts have no key of their own; you sign with the master or an approved API wallet and set `vaultAddress`.
 
@@ -251,7 +254,7 @@ python -m src.subaccount preflight   # go / no-go with remediation steps
 
 Only one hedge may be active at a time. An armed request that never opens expires after `HEDGE_EXPIRY_HOURS`; an opened hedge that never triggers auto-closes after `HEDGE_MAX_HOURS`.
 
-**Sizing note.** `HEDGE_ATR_FLOOR_PCT` floors the reference ATR at a percentile of its own recent history. This exists because catalysts arrive precisely when volatility is compressed, and the straddle backtest showed that stops sized off a squeezed ATR get *both* legs whipsawed by the expansion — average winner collapsed from $4.88 to $1.19. The floor keeps the stop wide enough to survive the move the hedge exists to capture.
+**Sizing note.** `HEDGE_ATR_FLOOR_PCT` floors the reference ATR at a percentile of its own recent history. This exists because catalysts arrive precisely when volatility is compressed, and backtesting showed that stops sized off a squeezed ATR get *both* legs whipsawed by the expansion — the average winner collapsed from $4.88 to $1.19. The floor keeps the stop wide enough to survive the move the hedge exists to capture.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -268,32 +271,16 @@ Only one hedge may be active at a time. An armed request that never opens expire
 
 #### The $100k sub-account gate
 
-Hyperliquid will not let an account create a sub-account until it has traded **$100,000 of lifetime volume**. If `subaccount preflight` reports `sub_account_exists FAIL` and the UI shows a volume message, this is why. Three ways past it:
+Hyperliquid will not let an account create a sub-account until it has traded **$100,000 of lifetime volume**. If `subaccount preflight` reports `sub_account_exists FAIL` and the UI shows a volume message, this is why. Two ways past it:
 
 1. **Use a second independent wallet instead.** A sub-account is a convenience, not a requirement — the hedge only needs a *second account* with its own net position. Any fresh address qualifies, with **no volume gate**, funded by an internal USDC send. `SubAccountAdapter` already takes an address and a signing key; a standalone wallet just skips the `vault_address` argument.
 2. **Wait.** The bot generates volume by trading normally, so the gate clears on its own.
-3. **Farm it** with `src/volume_farm.py`, below. Worth it on testnet, where fees are faucet money; rarely worth it on mainnet.
 
-```powershell
-python -m src.volume_farm --target 97056 --coin SOL --leverage 10            # dry run
-python -m src.volume_farm --target 97056 --coin SOL --leverage 10 --execute
-```
-
-It opens a position at market and closes it immediately, repeatedly. Every order crosses the real book, so this is churn rather than wash trading — it never places both sides of a match itself.
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--target` | required | Volume to generate in USD. A round trip of notional *N* counts as *2N*. |
-| `--coin` | `SOL` | Coin to churn. Must not be one the bot trades. |
-| `--leverage` | `5` | Higher means fewer trips at **identical total fees** — fees scale with volume, not trip count. |
-| `--max-notional` | `0` | Hard cap on notional per trip. |
-| `--execute` | off | Without it, prints the plan and exits. |
-| `--allow-mainnet` | off | Required on mainnet, where the fees are real. |
-| `--allow-bot-coin` | off | Permits churning a coin in `SYMBOLS`. Dangerous — see below. |
-
-> **The real hazard is collision, not fees.** Hyperliquid holds one net position per coin, and the bot may already hold one. A reduce-only close here would close *the bot's* position and desync its state, so the farmer refuses any coin in `SYMBOLS` and aborts if the target coin already has an open position. Pick a coin the bot does not trade.
-
-At the base taker rate of 0.045% per side, $97k of volume costs about **$44** — and that figure does not change with leverage or trip size, only with the volume itself.
+> A `volume_farm.py` tool that churned market orders to clear this gate has been
+> removed. It worked, but the hazard was never the fees (~$44 per $100k at the
+> base taker rate) — it was collision: Hyperliquid holds one net position per
+> coin, so a reduce-only close could close *the bot's* position and desync its
+> state. On a thin testnet book the slippage also dwarfed the fees.
 
 ### 9. MCP server (optional, agentic)
 
@@ -336,7 +323,7 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 |----------|---------|-------------|
 | `SYMBOLS` | `BTC/USDC:USDC,ETH/USDC:USDC` | Comma-separated perpetual symbols (base coin before `/`, e.g. `BTC`) |
 | `SHORT_SYMBOLS` | (empty) | Bases traded short-only (mirror logic); others are long. Empty = long-only |
-| `STRATEGY` | `dca` | `dca` (dip-buying) or `trend` (EMA/ATR trend-following) |
+| `STRATEGY` | `trend` | `trend` (EMA/ATR trend-following) or `hedge` (manual catalyst hedge only, no directional trading) |
 | `TIMEFRAME` | `15m` | Primary candle timeframe (use `4h` for `STRATEGY=trend`) |
 | `POLL_SECONDS` | `30` | Seconds between each polling loop |
 | `LOOKBACK_CANDLES` | `200` | Number of candles fetched for indicator calculation |
@@ -361,26 +348,12 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `CONSEC_HALT_HOURS` | `6` | Hours to pause after consecutive-loss halt |
 | `DAILY_LOSS_HALT_HOURS` | `12` | Hours to pause after drawdown halt |
 
-### Strategy — DCA (`STRATEGY=dca`)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LONG_MAX_PRICES` | `BTC:90000,ETH:3000` | Per-symbol long-entry price ceiling (shorts ignore it) |
-| `INITIAL_DIP_PCT` | `3.0` | % drop from the recent high to open the first leg |
-| `DCA_TRIGGER_PCT` | `10.0` | % further move past the last fill to add a leg |
-| `LEG_NOTIONAL_PCT` | `10.0` | % of starting equity per leg |
-| `MAX_DCA_LEGS` | `5` | Max legs per symbol |
-| `TRAIL_ACTIVATE_PCT` | `5.0` | Arm the trailing stop once this far in profit |
-| `TRAIL_DISTANCE_PCT` | `3.0` | Trail distance from the favorable extreme |
-| `STOP_LOSS_PCT` | `0` | Hard stop (0 = disabled) |
-| `TAKE_PROFIT_PCT` | `0` | Fixed take-profit (0 = disabled) |
-| `TREND_FILTER_ENABLED` | `true` | Only trade with the `TREND_EMA_PERIOD` EMA trend |
-| `TREND_EMA_PERIOD` | `200` | EMA period for the trend / regime filter (shared with trend mode) |
-
 ### Strategy — Trend-following (`STRATEGY=trend`, best on `TIMEFRAME=4h`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `DIRECTION_MODE` | `static` | `static` = `SHORT_SYMBOLS` pins each symbol's side; `signal` = the trend picks it per bar |
+| `TREND_EMA_PERIOD` | `200` | Regime EMA — price must be on its favorable side to enter |
 | `FAST_EMA` | `50` | Fast EMA for the trend cross |
 | `SLOW_EMA` | `200` | Slow EMA for the trend cross |
 | `ATR_PERIOD` | `14` | ATR lookback for stops/sizing |
@@ -399,7 +372,6 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `MTF_ENABLED` | `false` | Require higher-timeframe trend alignment for entries |
 | `MTF_TIMEFRAME` | `4h` | Higher timeframe for the MTF filter |
 | `MTF_EMA_PERIOD` | `50` | EMA period on the higher timeframe |
-| `DCA_CHANDELIER_ENABLED` | `false` | Use an ATR chandelier trail for the `dca` exit instead of the percent trail |
 
 ### Execution
 
@@ -408,7 +380,6 @@ All variables are loaded from `.env` via `python-dotenv`. See `.env.example` for
 | `ENTRY_FEE_BPS` | `2` | Entry fee in basis points (limit/maker) |
 | `EXIT_FEE_BPS` | `3.5` | Exit fee in basis points (market/taker) |
 | `SLIPPAGE_BPS` | `2` | Simulated slippage on exits |
-| `LIMIT_TIMEOUT_SECONDS` | `30` | Cancel unfilled limit orders after this many seconds |
 
 ### Daily briefing (Telegram + Gemini)
 
@@ -437,21 +408,18 @@ The Telegram control listener and MCP server reuse `TELEGRAM_BOT_TOKEN`, `TELEGR
 ```
 src/
   main.py           Entry point -- loads settings, runs bot (+ optional briefing/control threads)
-  bot.py            Main polling loop and per-symbol processing (DCA + trend paths)
+  bot.py            Main polling loop and per-symbol processing
   exchange.py       Hyperliquid official SDK adapter (with retry) + paper / live broker
-  strategy.py       STRATEGY=dca: dip-buying / DCA / trail / SL / TP (direction-aware)
+  indicators.py     Shared ATR/EMA/ADX math + the opt-in entry gates
   strategy_trend.py STRATEGY=trend: EMA cross + regime, ATR stops, chandelier trail, risk sizing
-  strategy_straddle.py  Research only: dual-leg straddle entry rule + winner triggers
-  strategy_squeeze.py   Volatility-compression detection (ATR/band-width percentiles, NR-k)
+  direction.py      Which side a symbol trades this bar (DIRECTION_MODE)
   hedge.py              Catalyst hedge: state machine + logs/hedge.json request channel
   hedge_broker.py       Catalyst hedge: sizing, leg execution, cut and trail
   subaccount.py         Sub-account order routing (vaultAddress), status and preflight
-  volume_farm.py        Round-trip volume generator for the $100k sub-account gate
-  risk.py           Position sizing and timer-based halt logic
+  risk.py           Timer-based halt logic (sizing lives in strategy_trend)
   config.py         Loads Settings from .env
-  models.py         Shared types: Position, TradeResult, PendingOrder
+  models.py         Shared types: Position, Leg, TradeResult
   backtest.py       Offline backtester on cached candle data
-  backtest_straddle.py  Straddle simulator + head-to-head report (python -m src.backtest_straddle)
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)
@@ -471,6 +439,9 @@ logs/
   briefing_state.json  Last UTC date the in-process daily briefing was sent (optional)
   control.json      Pause/resume state shared across processes (optional)
 scripts/
+  check-direction.py  Preflight: which side each symbol would trade right now
+  smoke-check.py    Paper-mode startup check: config, one real tick, agent-tool allowlist
+  log-stats.py      Summarize logs/events.jsonl volume by event type
   remote-update.sh  VM deploy script (CI/CD + manual)
   sync-logs.ps1     Pull live logs from GCP to ./logs (Windows)
   sync-logs.sh      Pull live logs from GCP to ./logs (bash)

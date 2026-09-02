@@ -147,13 +147,13 @@ function renderStatus(s) {
   if (!s.positions || s.positions.length === 0) {
     posDiv.innerHTML = '<div class="empty">No open positions.</div>';
   } else {
-    let h = "<table><tr><th>Symbol</th><th>Legs</th><th class='num'>Size</th>"
-      + "<th class='num'>Avg Entry</th><th class='num'>Stop</th><th>Trail</th></tr>";
+    let h = "<table><tr><th>Symbol</th><th>Side</th><th class='num'>Size</th>"
+      + "<th class='num'>Entry</th><th class='num'>Stop</th><th class='num'>Best</th></tr>";
     for (const p of s.positions) {
-      h += `<tr><td>${p.symbol}</td><td>${p.legs}/${p.max_legs}</td>`
+      h += `<tr><td>${p.symbol}</td><td>${p.side === "sell" ? "short" : "long"}</td>`
         + `<td class='num'>${fmt(p.size, 6)}</td><td class='num'>${fmt(p.avg_entry)}</td>`
-        + `<td class='num'>${p.trail_armed ? fmt(p.stop_price) : "—"}</td>`
-        + `<td>${p.trail_armed ? "armed" : "off"}</td></tr>`;
+        + `<td class='num'>${p.stop_price > 0 ? fmt(p.stop_price) : "—"}</td>`
+        + `<td class='num'>${p.peak_price > 0 ? fmt(p.peak_price) : "—"}</td></tr>`;
     }
     posDiv.innerHTML = h + "</table>";
   }

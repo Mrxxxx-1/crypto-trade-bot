@@ -10,9 +10,9 @@ rediscover it: the loser's realized loss always equals the winner's unrealized
 gain at the moment of the cut, so a hedge is *not* a way to make money. Its one
 real benefit is that the surviving leg's cost basis is fixed the instant the
 hedge opens, so a violent catalyst gap cannot slip your entry. It is therefore
-armed **manually, before a known event**, and never on a schedule. The
-``--entry-mode squeeze`` backtest in ``src/backtest_straddle.py`` measures what
-happens when you automate it: profit factor drops below 1.
+armed **manually, before a known event**, and never on a schedule. Automating
+entry off a volatility-compression signal was backtested and rejected: profit
+factor dropped below 1.
 
 Lifecycle
 ---------
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import Settings
-from .strategy_squeeze import atr_series, percentile_rank
+from .indicators import atr_series, percentile_rank
 
 HEDGE_FILENAME = "hedge.json"
 
@@ -75,7 +75,7 @@ def _parse_iso(value: Any) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Reference ATR: the fix for the squeeze finding
+# Reference ATR: stop sizing that survives a volatility expansion
 # ---------------------------------------------------------------------------
 
 def reference_atr(
@@ -87,8 +87,8 @@ def reference_atr(
     """ATR to size stops from, floored at a percentile of its own history.
 
     Hedges are armed before catalysts, which is exactly when realized volatility
-    is compressed — and the straddle backtest showed that sizing stops off a
-    squeezed ATR gets *both* legs whipsawed when the event finally moves price.
+    is compressed — and sizing stops off a squeezed ATR gets *both* legs
+    whipsawed when the event finally moves price.
     Flooring the ATR at, say, its median keeps the stop wide enough to survive
     the expansion the hedge exists to capture.
 
