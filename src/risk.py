@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from .config import Settings
 
@@ -30,16 +29,25 @@ class RiskState:
     """
     window_start_equity: float
     consecutive_losses: int = 0
-    halted_until: Optional[datetime] = field(default=None)
+    halted_until: datetime | None = field(default=None)
 
 
 class RiskManager:
-    """Enforce per-trade sizing, drawdown limits, and consecutive-loss halts."""
+    """Enforce drawdown limits and consecutive-loss halts.
 
-    def __init__(self, settings: Settings) -> None:
+    ``starting_equity`` seeds the drawdown baseline and must reflect the equity
+    the bot will actually be measured against: the live account balance in live
+    mode, ``INITIAL_EQUITY`` in paper. Seeding it from ``INITIAL_EQUITY`` while
+    trading a live account of a different size makes the bot halt on the first
+    ``can_trade`` call, before placing any trade.
+    """
+
+    def __init__(self, settings: Settings, starting_equity: float | None = None) -> None:
         self.settings = settings
         self.state = RiskState(
-            window_start_equity=settings.initial_equity,
+            window_start_equity=(
+                settings.initial_equity if starting_equity is None else starting_equity
+            ),
         )
 
     def _now(self) -> datetime:

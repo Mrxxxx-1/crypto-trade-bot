@@ -461,12 +461,12 @@ def _apply_overrides(settings: Settings, overrides: list[str]) -> Settings:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest the DCA-on-dips strategy on cached candle data")
+    parser = argparse.ArgumentParser(description="Backtest the trend-following strategy on cached candle data")
     parser.add_argument("--env", default=".env.example", help="Env file to load settings from")
     parser.add_argument("--data-dir", default="data", help="Directory with cached candle JSON files")
     parser.add_argument("--label", default="BACKTEST", help="Label for the report header")
     parser.add_argument("--set", nargs="*", default=[], dest="overrides",
-                        help="Override settings, e.g. --set DCA_TRIGGER_PCT=10 TRAIL_DISTANCE_PCT=2")
+                        help="Override settings, e.g. --set DIRECTION_MODE=signal ADX_MIN=25")
     args = parser.parse_args()
 
     load_dotenv(args.env, override=True)

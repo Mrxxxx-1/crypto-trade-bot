@@ -38,12 +38,15 @@ class FuturesBot:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.exchange = ExchangeAdapter(settings)
-        self.risk = RiskManager(settings)
+        # Broker first: LiveBroker syncs real account equity in its constructor,
+        # which is the baseline the drawdown guard has to measure against.
+        # PaperBroker leaves it at INITIAL_EQUITY.
         if settings.is_live:
             self.broker: PaperBroker | LiveBroker = LiveBroker(settings, self.exchange)
         else:
             self.broker = PaperBroker(settings, self.exchange)
-        self.starting_equity = settings.initial_equity
+        self.starting_equity = self.broker.equity
+        self.risk = RiskManager(settings, starting_equity=self.broker.equity)
         self.loop_count = 0
         # Heavy heartbeat fields are logged periodically; logs/state.json always
         # holds the latest full snapshot for the dashboard / MCP / Telegram layer.
