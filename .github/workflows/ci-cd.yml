@@ -33,7 +33,10 @@ jobs:
       - name: Import smoke test
         run: |
           python -c "from src.config import load_settings; load_settings()"
-          python -c "from src import bot, exchange, risk, strategy, strategy_trend, backtest"
+          python -c "from src import agent_tools, backtest, bot, briefing, config, control, direction, exchange, hedge, hedge_broker, indicators, log_hygiene, models, risk, strategy_trend, subaccount, telegram_control"
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
 
   deploy:
     name: Deploy to GCP
