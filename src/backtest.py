@@ -189,11 +189,15 @@ def _close_bt_position(
     reason: str,
     settings: Settings,
     candle_ts,
+    key: Optional[str] = None,
 ) -> float:
     """Close all legs at ``exit_at``, record the trade, and return realized net P&L.
 
     Direction-aware: a short (``side == "sell"``) profits when the exit price is
     below the average entry, so its raw P&L is negated.
+
+    ``key`` is the ``positions`` dict key when it differs from the reported
+    symbol, which the straddle engine needs to hold two legs per symbol.
     """
     exit_side = "sell" if pos.side == "buy" else "buy"
     exit_px = _exec_price(exit_at, exit_side, settings.slippage_bps)
@@ -218,7 +222,7 @@ def _close_bt_position(
             legs=len(pos.legs),
         )
     )
-    del positions[symbol]
+    del positions[key or symbol]
     return net_pnl
 
 

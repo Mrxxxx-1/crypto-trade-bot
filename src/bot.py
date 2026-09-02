@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict
 
-from . import control, log_hygiene
+from . import control, hedge, hedge_broker, log_hygiene
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
 from .risk import RiskManager
@@ -62,6 +62,15 @@ class FuturesBot:
         # Cross-process pause flag (toggled by the Telegram/MCP agent layer).
         # Re-read once per loop in run_forever; only blocks NEW entries/adds.
         self.paused = control.is_paused(settings.logs_dir)
+        # Manual catalyst hedge (opt-in). Built here so a misconfigured hedge
+        # surfaces at startup, but never prevents the bot from trading.
+        self.hedge: hedge_broker.HedgeManager | None = None
+        if settings.hedge_enabled:
+            try:
+                self.hedge = hedge_broker.build_manager(settings, log_event=self.broker.log_event)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self._utc_now()}] HEDGE disabled: {exc}")
+                self.broker.log_event("hedge_init_failed", {"error": str(exc)})
 
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -414,6 +423,27 @@ class FuturesBot:
             return f"{symbol} opened({direction}) avg={pos.entry_price:.4f} stop={init_stop:.4f}"
         return f"{symbol} no_entry broker_rejected last={last_close:.4f}"
 
+    def _hedge_candles(self, symbol: str) -> list:
+        """Closed candles for hedge ATR sizing (drops the forming bar)."""
+        ohlcv = self.exchange.fetch_ohlcv(
+            symbol, self.settings.timeframe, self.settings.lookback_candles
+        )
+        return ohlcv[:-1] if len(ohlcv) > 1 else ohlcv
+
+    def _poll_hedge(self) -> str:
+        """Advance the manual hedge, if one is armed. Never raises."""
+        if self.hedge is None:
+            return ""
+        try:
+            state = self.hedge.poll(self._hedge_candles, self.exchange.fetch_last_price)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self._utc_now()}] HEDGE ERROR {exc}")
+            self.broker.log_event("hedge_error", {"error": str(exc)})
+            return "hedge error"
+        if state is None:
+            return ""
+        return state.summary()
+
     def run_forever(self) -> None:
         """Main loop: process all symbols, sleep, log heartbeats."""
         print(
@@ -461,6 +491,9 @@ class FuturesBot:
                 statuses = []
                 for symbol in self.settings.symbols:
                     statuses.append(self._process_symbol(symbol))
+                hedge_status = self._poll_hedge()
+                if hedge_status:
+                    statuses.append(f"hedge: {hedge_status}")
                 if self.loop_count % self.settings.heartbeat_interval == 0:
                     print(
                         f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
@@ -478,6 +511,9 @@ class FuturesBot:
                         "positions": self._positions_snapshot(),
                         "statuses": statuses,
                     }
+                    if self.settings.hedge_enabled:
+                        active = hedge.read_hedge(self.settings.logs_dir)
+                        snapshot["hedge"] = active.to_dict() if active else None
                     log_hygiene.write_state_snapshot(
                         self.settings.logs_dir,
                         {"ts": self._utc_now(), "event": "heartbeat", **snapshot},

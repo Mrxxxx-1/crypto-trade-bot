@@ -135,6 +135,21 @@ class Settings:
     gemini_api_key: str
     daily_briefing_hour_utc: int
 
+    # --- Manual catalyst hedge (see src/hedge.py) ---
+    # A hedge holds mirrored long/short legs on one coin. Hyperliquid nets one
+    # position per coin, so the short leg is routed to a sub-account via the
+    # signed action's vaultAddress field.
+    hedge_enabled: bool                # master switch; False disables all hedge code paths
+    hedge_sub_account: str             # sub-account address holding the short leg
+    hedge_sub_private_key: str         # separate API wallet for the sub leg; see note below
+    hedge_symbols: List[str]           # coins the hedge may be armed on
+    hedge_risk_pct: float              # % of combined equity risked per leg
+    hedge_stop_atr_mult: float         # initial stop distance = this * reference ATR
+    hedge_trail_atr_mult: float        # winner's chandelier distance = this * reference ATR
+    hedge_atr_floor_pct: float         # ATR percentile floor: guards against sizing off a squeezed ATR
+    hedge_max_hours: float             # auto-close an un-triggered hedge after this long; 0 disables
+    hedge_expiry_hours: float          # an armed-but-unfilled request expires after this long
+
     # Web dashboard + agentic control surfaces
     dashboard_host: str
     dashboard_port: int
@@ -161,6 +176,11 @@ class Settings:
             and self.telegram_chat_id.strip()
             and self.gemini_api_key.strip()
         )
+
+    @property
+    def hedge_configured(self) -> bool:
+        """A hedge needs a funded sub-account address to hold the short leg."""
+        return bool(self.hedge_enabled and self.hedge_sub_account.strip())
 
     def max_price_for(self, symbol: str) -> float:
         """Return the long-entry price ceiling for ``symbol``; +inf if uncapped."""
@@ -270,6 +290,22 @@ def load_settings() -> Settings:
         daily_briefing_hour_utc=max(
             0, min(23, _as_int("DAILY_BRIEFING_HOUR_UTC", 6))
         ),
+        # Manual catalyst hedge (off unless explicitly enabled)
+        hedge_enabled=os.getenv("HEDGE_ENABLED", "").lower() in ("1", "true", "yes"),
+        hedge_sub_account=os.getenv("HEDGE_SUB_ACCOUNT", "").strip(),
+        hedge_sub_private_key=os.getenv("HEDGE_SUB_PRIVATE_KEY", "").strip(),
+        hedge_symbols=[
+            s.strip()
+            for s in os.getenv("HEDGE_SYMBOLS", os.getenv("SYMBOLS", "")).split(",")
+            if s.strip()
+        ],
+        hedge_risk_pct=_as_float("HEDGE_RISK_PCT", 0.5),
+        hedge_stop_atr_mult=_as_float("HEDGE_STOP_ATR_MULT", 2.0),
+        hedge_trail_atr_mult=_as_float("HEDGE_TRAIL_ATR_MULT", 4.0),
+        hedge_atr_floor_pct=_as_float("HEDGE_ATR_FLOOR_PCT", 50.0),
+        hedge_max_hours=_as_float("HEDGE_MAX_HOURS", 48.0),
+        hedge_expiry_hours=_as_float("HEDGE_EXPIRY_HOURS", 12.0),
+
         dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0",
         dashboard_port=_as_int("DASHBOARD_PORT", 8000),
         dashboard_demo_mode=os.getenv("DASHBOARD_DEMO_MODE", "").lower()

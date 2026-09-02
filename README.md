@@ -35,6 +35,12 @@ Backtest (22 months, 4h BTC/ETH, `STRATEGY=trend`): **+11.7%** return, **1.27**
 profit factor, **16.4%** max drawdown — a ~35% win rate with average win ≈ 2.4×
 average loss. Backtested, not live; figures depend on the window and parameters.
 
+### Dual-leg straddle (research only, not a `STRATEGY=` value)
+
+A simulator that opens a mirrored long and short on one symbol and cuts the loser once a
+trend declares itself. It is not selectable in the live bot — Hyperliquid nets to one
+position per coin. See [4b. Straddle backtest](#4b-straddle-backtest-research-only).
+
 ### Entry-quality filters (opt-in)
 
 Four filters can tighten entries on top of either strategy. **All are disabled by
@@ -107,6 +113,64 @@ python -m src.backtest --env .env --set STRATEGY=trend TIMEFRAME=4h LOOKBACK_CAN
 python -m src.backtest --env .env --set STRATEGY=dca STOP_LOSS_PCT=30 TAKE_PROFIT_PCT=20
 ```
 
+### 4b. Straddle backtest (research only)
+
+`python -m src.backtest_straddle` simulates a **dual-leg straddle**: open a long and a
+short on the same symbol at the same time with identical size and identical ATR stop
+distance, wait for a trigger to declare which way the market is going, close the losing
+leg, and let the winner ride the usual chandelier trail.
+
+This is **simulation only and is not wired into the live bot**. Hyperliquid holds one net
+position per coin, so two opposing legs in one account would simply cancel out; running it
+live would need a second sub-account.
+
+```powershell
+python -m src.fetch_candles --timeframes 4h --days 730
+python -m src.backtest_straddle --env .env --compare
+python -m src.backtest_straddle --env .env --entry-mode chop --compare
+python -m src.backtest_straddle --env .env --trigger atr --trigger-atr-mult 1.5
+python -m src.backtest_straddle --env .env --trigger range --range-lookback 20
+```
+
+Use `--env .env` (not the `.env.example` default) so the run uses your live trend
+parameters. `--compare` runs the ordinary trend backtest over the identical candles and
+prints a head-to-head table.
+
+| Flag | Values | Meaning |
+| --- | --- | --- |
+| `--entry-mode` | `always` (default), `chop`, `squeeze` | When to open a pair. `chop` is the exact inverse of the live `ADX_MIN` filter: straddle only where the directional strategy would stay out. `squeeze` requires volatility compression (see below). |
+| `--trigger` | `trend_signal` (default), `atr`, `range` | Which rule declares the winning leg. |
+| `--trigger-atr-mult` | float, default `1.0` | `atr` trigger: cut the leg that is this many ATRs offside from the pair entry. |
+| `--range-lookback` | int, default `20` | `range` trigger: cut when price breaks the high/low of the last N bars. |
+| `--compare` | flag | Also run the baseline trend strategy and print the delta. |
+| `--set KEY=VALUE` | | Same override syntax as `src.backtest`. |
+
+**Volatility compression (`--entry-mode squeeze`)** uses `src/strategy_squeeze.py`, which
+ranks current volatility against the symbol's own recent history so thresholds are
+scale-free across BTC and ETH:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--squeeze-lookback` | `120` | Bars the percentiles rank against. |
+| `--squeeze-atr-pct` | `20` | Max ATR percentile to count as compressed; `0` disables. |
+| `--squeeze-bbw-pct` | `20` | Max Bollinger-width percentile; `0` disables. |
+| `--squeeze-nr` | `0` | Also require the narrowest bar range of the last N bars. |
+| `--squeeze-combine` | `all` | Require every enabled check, or `any` one of them. |
+
+> **Measured result:** squeeze-gated entry *loses* money on BTC/ETH 4h (profit factor
+> 0.98–1.10 across thresholds, versus 1.45 for the baseline). The cause is visible in the
+> pair economics: entering while ATR is in its calmest 20% means the ATR stop and the
+> 6×ATR chandelier are tiny in absolute terms, so the expansion whipsaws *both* legs out.
+> Average winner leg falls to +$1.19 (versus +$4.88 for `--entry-mode chop`) while losers
+> stay the same size. Volatility compression is a bad time to size off ATR.
+
+On top of the standard trade report it prints pair economics: pairs opened, how each was
+resolved, average winner and loser legs, and the **loser-leg fee drag** — the extra round
+trip the pair pays versus a single directional entry. `tests/test_straddle.py` proves the
+identity behind that line: a straddle cycle equals a single entry at the cut price minus
+exactly those extra fees, so the pair mechanic itself adds no edge. Any improvement in the
+report comes from the *entry rule*, not from holding both sides.
+
 ### 5. Run the bot
 
 ```powershell
@@ -153,9 +217,83 @@ Turns the one-way briefing into an interactive control channel. You message the 
 python -m src.telegram_control
 ```
 
-Or set `TELEGRAM_CONTROL_ENABLED=true` to run it inside `python -m src.main`. Commands: `/status`, `/pnl [hours]`, `/trades [n]`, `/positions`, `/events [n]`, `/briefing`, `/pause [reason]`, `/resume`, `/help`. Only messages from your `TELEGRAM_CHAT_ID` are honored.
+Or set `TELEGRAM_CONTROL_ENABLED=true` to run it inside `python -m src.main`. Commands: `/status`, `/pnl [hours]`, `/trades [n]`, `/positions`, `/events [n]`, `/briefing`, `/pause [reason]`, `/resume`, `/hedge`, `/help`. Only messages from your `TELEGRAM_CHAT_ID` are honored.
 
-> **Safety boundary:** the agent can read stats and **pause/resume** trading only. It can **never open, close, or modify a position**, and cannot switch to live mode. Pausing blocks *new* entries and DCA adds; open positions keep their trailing-stop protection. This is enforced by construction — the shared tool registry (`src/agent_tools.py`) contains no order-placement tool.
+> **Safety boundary:** free text routed through Gemini can read stats and **pause/resume** trading only. It can **never open, close, or modify a position**, and cannot switch to live mode. This is enforced by construction — the shared tool registry (`src/agent_tools.py`) contains no order-placement tool, and `tests/test_hedge.py` asserts it stays that way. The single exception is `/hedge arm`, a hard-coded slash command that is deliberately *not* registered as a tool, so no phrasing of a plain-language message can reach it.
+
+### 8b. Catalyst hedge (optional, manual)
+
+A **hedge** opens a mirrored long and short on one coin before a scheduled event (CPI, FOMC, an ETF decision). Whichever stop the market reaches first identifies the losing leg: it is cut for a capped loss, and the survivor trails.
+
+> **Read this before enabling it.** A hedge cannot generate profit on its own. The loser's realized loss always equals the winner's unrealized gain at the moment of the cut, in every price path, so the pair is exactly equivalent to a single position entered at the cut price — minus an extra round trip in fees. Its one real benefit is that the survivor's cost basis is fixed the instant the hedge opens, so a violent catalyst gap cannot slip your entry. That is worth a few bps for a known event and nothing at all as a daily strategy: `--entry-mode squeeze` in the straddle backtest measures the automated version and its profit factor drops below 1.
+
+**Setup.** Hyperliquid holds one net position per coin, so the two legs need two accounts. Sub-accounts have no key of their own; you sign with the master or an approved API wallet and set `vaultAddress`.
+
+1. **Create a sub-account** in the Hyperliquid UI (Portfolio → Sub-Accounts). An API wallet *cannot* do this — it is an owner-level action.
+2. **Fund it** by transferring USDC from the main account, again in the UI. An even split gives both legs the same margin.
+3. **Approve a second API wallet** on the master and put its key in `HEDGE_SUB_PRIVATE_KEY`. Hyperliquid tracks nonces per signer, and the hedge fires both legs simultaneously, so sharing one key between them risks a nonce collision.
+4. **Verify** — this checks every precondition and prints the fix for each failure:
+
+```powershell
+python -m src.subaccount status      # addresses, roles, sub-accounts, balances
+python -m src.subaccount preflight   # go / no-go with remediation steps
+```
+
+5. Set `HEDGE_ENABLED=true` and `HEDGE_SUB_ACCOUNT=0x...`, then restart the bot.
+
+**Use.**
+
+```
+/hedge arm BTC CPI print    # request a hedge; the bot opens it on its next poll
+/hedge                      # status: legs, stops, realized P&L
+/hedge close                # flatten immediately
+```
+
+Only one hedge may be active at a time. An armed request that never opens expires after `HEDGE_EXPIRY_HOURS`; an opened hedge that never triggers auto-closes after `HEDGE_MAX_HOURS`.
+
+**Sizing note.** `HEDGE_ATR_FLOOR_PCT` floors the reference ATR at a percentile of its own recent history. This exists because catalysts arrive precisely when volatility is compressed, and the straddle backtest showed that stops sized off a squeezed ATR get *both* legs whipsawed by the expansion — average winner collapsed from $4.88 to $1.19. The floor keeps the stop wide enough to survive the move the hedge exists to capture.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HEDGE_ENABLED` | `false` | Master switch. Every hedge code path is inert when false. |
+| `HEDGE_SUB_ACCOUNT` | — | Sub-account address holding the short leg. |
+| `HEDGE_SUB_PRIVATE_KEY` | — | Second API wallet for the short leg (avoids nonce collisions). |
+| `HEDGE_SYMBOLS` | `SYMBOLS` | Coins the hedge may be armed on. |
+| `HEDGE_RISK_PCT` | `0.5` | Percent of combined equity risked per leg — this is the capped loss. |
+| `HEDGE_STOP_ATR_MULT` | `2.0` | Initial stop distance in reference ATRs. |
+| `HEDGE_TRAIL_ATR_MULT` | `4.0` | Winner's trailing distance in reference ATRs. |
+| `HEDGE_ATR_FLOOR_PCT` | `50.0` | Percentile floor on the reference ATR; `0` disables. |
+| `HEDGE_MAX_HOURS` | `48` | Auto-close an untriggered hedge; `0` disables. |
+| `HEDGE_EXPIRY_HOURS` | `12` | An armed-but-unopened request expires. |
+
+#### The $100k sub-account gate
+
+Hyperliquid will not let an account create a sub-account until it has traded **$100,000 of lifetime volume**. If `subaccount preflight` reports `sub_account_exists FAIL` and the UI shows a volume message, this is why. Three ways past it:
+
+1. **Use a second independent wallet instead.** A sub-account is a convenience, not a requirement — the hedge only needs a *second account* with its own net position. Any fresh address qualifies, with **no volume gate**, funded by an internal USDC send. `SubAccountAdapter` already takes an address and a signing key; a standalone wallet just skips the `vault_address` argument.
+2. **Wait.** The bot generates volume by trading normally, so the gate clears on its own.
+3. **Farm it** with `src/volume_farm.py`, below. Worth it on testnet, where fees are faucet money; rarely worth it on mainnet.
+
+```powershell
+python -m src.volume_farm --target 97056 --coin SOL --leverage 10            # dry run
+python -m src.volume_farm --target 97056 --coin SOL --leverage 10 --execute
+```
+
+It opens a position at market and closes it immediately, repeatedly. Every order crosses the real book, so this is churn rather than wash trading — it never places both sides of a match itself.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--target` | required | Volume to generate in USD. A round trip of notional *N* counts as *2N*. |
+| `--coin` | `SOL` | Coin to churn. Must not be one the bot trades. |
+| `--leverage` | `5` | Higher means fewer trips at **identical total fees** — fees scale with volume, not trip count. |
+| `--max-notional` | `0` | Hard cap on notional per trip. |
+| `--execute` | off | Without it, prints the plan and exits. |
+| `--allow-mainnet` | off | Required on mainnet, where the fees are real. |
+| `--allow-bot-coin` | off | Permits churning a coin in `SYMBOLS`. Dangerous — see below. |
+
+> **The real hazard is collision, not fees.** Hyperliquid holds one net position per coin, and the bot may already hold one. A reduce-only close here would close *the bot's* position and desync its state, so the farmer refuses any coin in `SYMBOLS` and aborts if the target coin already has an open position. Pick a coin the bot does not trade.
+
+At the base taker rate of 0.045% per side, $97k of volume costs about **$44** — and that figure does not change with leverage or trip size, only with the volume itself.
 
 ### 9. MCP server (optional, agentic)
 
@@ -303,10 +441,17 @@ src/
   exchange.py       Hyperliquid official SDK adapter (with retry) + paper / live broker
   strategy.py       STRATEGY=dca: dip-buying / DCA / trail / SL / TP (direction-aware)
   strategy_trend.py STRATEGY=trend: EMA cross + regime, ATR stops, chandelier trail, risk sizing
+  strategy_straddle.py  Research only: dual-leg straddle entry rule + winner triggers
+  strategy_squeeze.py   Volatility-compression detection (ATR/band-width percentiles, NR-k)
+  hedge.py              Catalyst hedge: state machine + logs/hedge.json request channel
+  hedge_broker.py       Catalyst hedge: sizing, leg execution, cut and trail
+  subaccount.py         Sub-account order routing (vaultAddress), status and preflight
+  volume_farm.py        Round-trip volume generator for the $100k sub-account gate
   risk.py           Position sizing and timer-based halt logic
   config.py         Loads Settings from .env
   models.py         Shared types: Position, TradeResult, PendingOrder
   backtest.py       Offline backtester on cached candle data
+  backtest_straddle.py  Straddle simulator + head-to-head report (python -m src.backtest_straddle)
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)

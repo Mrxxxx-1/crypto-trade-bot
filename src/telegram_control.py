@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from . import agent_tools
+from . import agent_tools, hedge
 from .briefing import _gemini_generate, _telegram_send
 from .config import Settings, load_settings
 
@@ -39,7 +39,8 @@ _API = "https://api.telegram.org/bot{token}/{method}"
 
 HELP_TEXT = (
     "Crypto bot control. I can read stats and pause/resume trading.\n"
-    "I can NOT open or close positions.\n\n"
+    "Plain-language requests can NEVER open or close a position.\n"
+    "The only exception is the explicit /hedge command below.\n\n"
     "Commands:\n"
     "/status — equity, open positions, pause state\n"
     "/pnl [hours] — P&L summary (default 24h)\n"
@@ -49,6 +50,9 @@ HELP_TEXT = (
     "/briefing — latest daily briefing\n"
     "/pause [reason] — stop NEW entries (keeps open positions)\n"
     "/resume — allow new entries again\n"
+    "/hedge — catalyst hedge status\n"
+    "/hedge arm BTC [note] — open mirrored long+short before an event\n"
+    "/hedge close — flatten the hedge now\n"
     "/help — this message\n\n"
     "Or just ask in plain language (e.g. \"how did we do today?\", \"stop buying\")."
 )
@@ -177,6 +181,68 @@ def _fmt_result(tool: str, result: dict[str, Any]) -> str:
 # Command + natural-language routing
 # ---------------------------------------------------------------------------
 
+def _fmt_hedge(payload: dict[str, Any]) -> str:
+    """Render a hedge status or command result for Telegram."""
+    if payload.get("ok") is False:
+        return f"Hedge rejected: {payload.get('error', 'unknown reason')}"
+    if payload.get("ok") is True:
+        action = payload.get("action", "ok")
+        detail = payload.get("detail", "")
+        symbol = payload.get("symbol", "")
+        note = payload.get("note")
+        lines = [f"Hedge {action}: {symbol}".strip()]
+        if note:
+            lines.append(f"note: {note}")
+        if detail:
+            lines.append(detail)
+        else:
+            lines.append("The bot will act on its next poll. Send /hedge to watch it.")
+        return "\n".join(lines)
+
+    if payload.get("state") == "none":
+        enabled = payload.get("hedge_enabled")
+        configured = payload.get("configured")
+        head = "No hedge has been armed."
+        if not enabled:
+            head += "\nHEDGE_ENABLED is false."
+        elif not configured:
+            head += "\nHEDGE_SUB_ACCOUNT is not set; run: python -m src.subaccount preflight"
+        return f"{head}\nSymbols: {', '.join(payload.get('symbols') or []) or '(none)'}"
+
+    lines = [payload.get("summary", "hedge")]
+    if payload.get("realized_pnl"):
+        lines.append(f"realized: {payload['realized_pnl']:+.2f}")
+    if payload.get("atr_pct") is not None:
+        lines.append(f"ATR percentile at open: p{payload['atr_pct']:.0f}")
+    return "\n".join(lines)
+
+
+def _handle_hedge(settings: Settings, args: list[str]) -> str:
+    """Explicit, hard-coded hedge control.
+
+    Deliberately NOT registered in ``agent_tools``: the Gemini router may only
+    ever reach read tools plus pause/resume, so no phrasing of a plain-language
+    message can open a position. Opening one requires typing this command.
+    """
+    sub = (args[0].lower() if args else "status")
+
+    if sub in ("status", ""):
+        return _fmt_hedge(hedge.hedge_status(settings))
+
+    if sub in ("close", "disarm", "flatten", "cancel"):
+        return _fmt_hedge(hedge.request_close(settings, by="telegram"))
+
+    if sub == "arm":
+        if len(args) < 2:
+            allowed = ", ".join(settings.hedge_symbols) or "(none configured)"
+            return f"Usage: /hedge arm <symbol> [note]\nAvailable: {allowed}"
+        symbol = args[1]
+        note = " ".join(args[2:])
+        return _fmt_hedge(hedge.request_hedge(settings, symbol, note=note, by="telegram"))
+
+    return "Usage: /hedge [status|arm <symbol> [note]|close]"
+
+
 def _handle_slash(settings: Settings, text: str) -> str | None:
     parts = text.strip().split()
     cmd = parts[0].lstrip("/").lower().split("@")[0]
@@ -207,6 +273,8 @@ def _handle_slash(settings: Settings, text: str) -> str | None:
         return _fmt_result("pause_trading", agent_tools.pause_trading(settings, reason=reason, by="telegram"))
     if cmd == "resume":
         return _fmt_result("resume_trading", agent_tools.resume_trading(settings, by="telegram"))
+    if cmd == "hedge":
+        return _handle_hedge(settings, parts[1:])
     return f"Unknown command /{cmd}. Send /help for the list."
 
 
