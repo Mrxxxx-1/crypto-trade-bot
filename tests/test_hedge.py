@@ -315,6 +315,50 @@ class ManualCloseTest(HedgeTestCase):
         self.assertEqual(len(self.main.closes), 1)
         self.assertEqual(len(self.sub.closes), 1)
 
+    def test_closing_the_long_promotes_the_short_to_winner(self) -> None:
+        mgr = self.manager()
+        self.arm(mgr)
+        result = hedge.request_close(self.settings, target="long")
+        self.assertTrue(result["ok"], result)
+        self.poll(mgr, 101.0)
+
+        state = hedge.read_hedge(self.settings.logs_dir)
+        self.assertEqual(state.state, CUT)
+        self.assertEqual(state.winner, SHORT)
+        self.assertFalse(state.leg(LONG).is_open)
+        self.assertTrue(state.leg(SHORT).is_open)
+        self.assertEqual(len(self.main.closes), 1)
+        self.assertEqual(len(self.sub.closes), 0)
+
+    def test_closing_the_winner_banks_only_the_survivor(self) -> None:
+        mgr = self.manager()
+        self.arm(mgr)
+        hedge.request_close(self.settings, target="long")
+        self.poll(mgr, 101.0)
+        hedge.request_close(self.settings, target="winner")
+        self.poll(mgr, 104.0)
+
+        state = hedge.read_hedge(self.settings.logs_dir)
+        self.assertEqual(state.state, CLOSED)
+        self.assertFalse(state.open_legs)
+        self.assertEqual(len(self.main.closes), 1)
+        self.assertEqual(len(self.sub.closes), 1)
+
+    def test_winner_close_is_rejected_before_a_cut(self) -> None:
+        mgr = self.manager()
+        self.arm(mgr)
+        result = hedge.request_close(self.settings, target="winner")
+        self.assertFalse(result["ok"])
+        self.assertEqual(hedge.read_hedge(self.settings.logs_dir).state, OPEN)
+
+    def test_telegram_close_long_is_a_cut_not_a_flatten(self) -> None:
+        mgr = self.manager()
+        self.arm(mgr)
+        reply = _handle_hedge(self.settings, ["close", "long"])
+        self.assertIn("cut", reply.lower())
+        self.poll(mgr, 100.5)
+        self.assertEqual(hedge.read_hedge(self.settings.logs_dir).winner, SHORT)
+
     def test_an_untriggered_hedge_closes_after_max_hours(self) -> None:
         mgr = self.manager()
         self.arm(mgr)

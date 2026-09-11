@@ -23,7 +23,7 @@ def main() -> None:
             "*** LIVE MODE — real orders will be placed on Hyperliquid ***\n"
             f"    Wallet : {settings.wallet_address[:8]}…{settings.wallet_address[-4:]}\n"
             f"    Symbols: {settings.symbols}\n"
-            f"    Leverage cap: {settings.max_leverage}x\n"
+            f"    Leverage cap: {settings.max_leverage}x ({settings.margin_mode})\n"
             f"    Risk/trade: {settings.risk_per_trade_pct}%\n"
             f"    Testnet: {settings.testnet}\n"
         )

@@ -14,6 +14,7 @@ from typing import List
 from dotenv import load_dotenv
 
 STRATEGIES = ("trend", "hedge")
+MARGIN_MODES = ("isolated", "cross")
 
 
 def _as_float(name: str, default: float) -> float:
@@ -62,6 +63,16 @@ def _parse_direction_mode(raw: str) -> str:
     return mode
 
 
+def _parse_margin_mode(raw: str) -> str:
+    """Validate ``MARGIN_MODE``; raise on typos so they surface at startup."""
+    mode = (raw or "isolated").strip().lower() or "isolated"
+    if mode not in MARGIN_MODES:
+        raise ValueError(
+            f"MARGIN_MODE must be one of {MARGIN_MODES}, got '{raw}'"
+        )
+    return mode
+
+
 @dataclass(frozen=True)
 class Settings:
     mode: str
@@ -78,6 +89,7 @@ class Settings:
 
     initial_equity: float
     max_leverage: float
+    margin_mode: str                   # "isolated" or "cross" (Hyperliquid updateLeverage)
     max_daily_loss_pct: float
     max_consecutive_losses: int
 
@@ -164,6 +176,11 @@ class Settings:
         """A hedge needs a funded sub-account address to hold the short leg."""
         return bool(self.hedge_enabled and self.hedge_sub_account.strip())
 
+    @property
+    def is_cross_margin(self) -> bool:
+        """True when Hyperliquid ``updateLeverage`` should send ``isCross=true``."""
+        return self.margin_mode == "cross"
+
     def direction_for(self, symbol: str) -> str:
         """Return ``"short"`` if the symbol's base is in ``short_symbols``, else ``"long"``.
 
@@ -203,6 +220,7 @@ def load_settings() -> Settings:
         lookback_candles=_as_int("LOOKBACK_CANDLES", 200),
         initial_equity=_as_float("INITIAL_EQUITY", 10_000),
         max_leverage=_as_float("MAX_LEVERAGE", 3),
+        margin_mode=_parse_margin_mode(os.getenv("MARGIN_MODE", "isolated")),
         max_daily_loss_pct=_as_float("MAX_DAILY_LOSS_PCT", 2.0),
         max_consecutive_losses=_as_int("MAX_CONSECUTIVE_LOSSES", 3),
 

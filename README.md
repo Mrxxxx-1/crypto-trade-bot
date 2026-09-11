@@ -130,6 +130,7 @@ candles on subsequent ticks.
 |-------|---------|--------|
 | Per-trade sizing | Risk `RISK_PER_TRADE_PCT` of equity per trade | Caps position size |
 | Max leverage | Notional > `MAX_LEVERAGE` x equity | Caps position size |
+| Margin mode | `MARGIN_MODE=isolated` (default) or `cross` | Isolated caps liquidation at the position's reserved margin; applied on both the main and hedge sub-account |
 | Consecutive losses | Streak >= `MAX_CONSECUTIVE_LOSSES` | Halt all trading for `CONSEC_HALT_HOURS` |
 | Rolling drawdown | Drawdown from window start >= `MAX_DAILY_LOSS_PCT` | Halt all trading for `DAILY_LOSS_HALT_HOURS` |
 
@@ -249,7 +250,10 @@ python -m src.subaccount preflight   # go / no-go with remediation steps
 ```
 /hedge arm BTC CPI print    # request a hedge; the bot opens it on its next poll
 /hedge                      # status: legs, stops, realized P&L
-/hedge close                # flatten immediately
+/hedge close                # abort: flatten both legs
+/hedge close long           # you pick the loser; the short becomes winner and trails
+/hedge close short          # you pick the loser; the long becomes winner and trails
+/hedge close winner         # bank the surviving leg after a cut
 ```
 
 Only one hedge may be active at a time. An armed request that never opens expires after `HEDGE_EXPIRY_HOURS`; an opened hedge that never triggers auto-closes after `HEDGE_MAX_HOURS`.

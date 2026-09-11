@@ -41,6 +41,7 @@ from .hedge import (
     HedgeLeg,
     HedgeState,
 )
+from .margin import apply_account_leverage
 
 MAIN = "main"
 SUB = "sub"
@@ -191,10 +192,15 @@ class HedgeManager:
         if state.state == REQUESTED:
             return self._open_pair(state, fetch_candles, price)
 
-        manual = state.cut_reason.startswith("manual_close")
-        if manual or state.stale(self.settings.hedge_max_hours, self._now()):
-            reason = state.cut_reason if manual else "hedge_max_hours"
-            return self._flatten(state, price, reason)
+        reason = state.cut_reason
+        if reason.startswith("manual_cut:"):
+            side = reason.split(":", 1)[1].split("_by_", 1)[0]
+            return self._cut_named_leg(state, side, price)
+        if reason.startswith("manual_close_winner"):
+            return self._close_winner(state, price, reason)
+        flatten = reason.startswith("manual_close")
+        if flatten or state.stale(self.settings.hedge_max_hours, self._now()):
+            return self._flatten(state, price, reason if flatten else "hedge_max_hours")
 
         if state.state == OPEN:
             return self._check_stops(state, price)
@@ -348,18 +354,42 @@ class HedgeManager:
             # Legs out of sync with the state machine; flatten rather than guess.
             return self._flatten(state, price, "desynced_legs")
 
-        loser: Optional[HedgeLeg] = None
+        loser: HedgeLeg | None = None
         if long_leg.stop_price > 0 and price <= long_leg.stop_price:
             loser = long_leg
         elif short_leg.stop_price > 0 and price >= short_leg.stop_price:
             loser = short_leg
         if loser is None:
             return state
+        # Close at the stop, not the overshoot, so the loss stays capped.
+        return self._promote_winner(state, loser, loser.stop_price, "stop_hit")
 
+    def _cut_named_leg(self, state: HedgeState, side: str, price: float) -> HedgeState:
+        """Manual cut: close ``side`` as the loser, trail the other."""
+        if state.state == CUT:
+            if state.winner == side:
+                return self._close_winner(state, price, state.cut_reason)
+            return self._save(state)
+
+        loser = state.leg(side)
+        if loser is None or not loser.is_open:
+            return self._flatten(state, price, "desynced_legs")
+        return self._promote_winner(
+            state, loser, price, state.cut_reason or f"manual_cut:{side}"
+        )
+
+    def _promote_winner(
+        self,
+        state: HedgeState,
+        loser: HedgeLeg,
+        price: float,
+        reason: str,
+    ) -> HedgeState:
+        """Close the losing leg and start trailing the survivor."""
         executor = self._executor(loser.account)
         assert executor
         try:
-            fill, _ = executor.close(state.symbol, loser.size, loser.stop_price)
+            fill, _ = executor.close(state.symbol, loser.size, price)
         except Exception as exc:  # noqa: BLE001
             state.error = f"failed to cut {loser.direction} leg: {exc}"
             self._log(
@@ -374,8 +404,7 @@ class HedgeManager:
         state.state = CUT
         state.cut_price = fill
         state.cut_at = self._iso()
-        state.cut_reason = "stop_hit"
-        # Re-anchor the winner's trail to the best price seen so far.
+        state.cut_reason = reason
         winner_leg = state.legs[winner]
         winner_leg.peak_price = (
             max(winner_leg.peak_price, price) if winner == LONG else min(winner_leg.peak_price, price)
@@ -390,9 +419,20 @@ class HedgeManager:
                 "cut_price": fill,
                 "loser_pnl": loser.realized_pnl,
                 "winner_stop": winner_leg.stop_price,
+                "reason": reason,
             },
         )
         return self._save(state)
+
+    def _close_winner(self, state: HedgeState, price: float, reason: str) -> HedgeState:
+        """Bank the surviving leg at market (manual take-profit)."""
+        winner = state.winner
+        leg = state.leg(winner) if winner else None
+        if leg is None or not leg.is_open:
+            state.state = CLOSED
+            state.closed_at = self._iso()
+            return self._save(state)
+        return self._exit_winner(state, leg, price, reason)
 
     def _apply_trail(self, leg: HedgeLeg, ref_atr: float) -> None:
         """Ratchet the winner's stop toward its best price; never loosen it."""
@@ -424,26 +464,35 @@ class HedgeManager:
         )
         if not hit:
             return self._save(state)
+        return self._exit_winner(state, leg, price, "trail")
 
+    def _exit_winner(
+        self,
+        state: HedgeState,
+        leg: HedgeLeg,
+        price: float,
+        reason: str,
+    ) -> HedgeState:
         executor = self._executor(leg.account)
         assert executor
         try:
-            fill, _ = executor.close(state.symbol, leg.size, leg.stop_price)
+            fill, _ = executor.close(state.symbol, leg.size, price)
         except Exception as exc:  # noqa: BLE001
             state.error = f"failed to close winner: {exc}"
             self._log("hedge_error", {"symbol": state.symbol, "error": state.error})
             return self._save(state)
 
-        self._close_leg(state, leg, fill, "trail")
+        self._close_leg(state, leg, fill, reason)
         state.state = CLOSED
         state.closed_at = self._iso()
         self._log(
             "hedge_closed",
             {
                 "symbol": state.symbol,
-                "winner": winner,
+                "winner": state.winner,
                 "winner_pnl": leg.realized_pnl,
                 "total_pnl": state.realized_pnl,
+                "reason": reason,
             },
         )
         return self._save(state)
@@ -490,6 +539,13 @@ def build_manager(
     from .subaccount import build_adapters
 
     main_adapter, sub_adapter = build_adapters(settings)
+
+    # Same leverage + margin mode on both wallets. The sub-account used to keep
+    # Hyperliquid's default (often 20x cross), which only changed the reserved
+    # margin, not the hedge size.
+    coins = settings.hedge_symbols or settings.symbols
+    apply_account_leverage(main_adapter, settings, coins)
+    apply_account_leverage(sub_adapter, settings, coins)
     return HedgeManager(
         settings,
         main=LegExecutor(main_adapter, MAIN),

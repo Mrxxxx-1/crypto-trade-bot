@@ -22,6 +22,7 @@ from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 
 from . import log_hygiene
 from .config import Settings
+from .margin import apply_account_leverage
 from .models import Leg, Position, Side, TradeResult
 
 T = TypeVar("T")
@@ -346,7 +347,7 @@ class ExchangeAdapter:
         x = self._hlx
 
         def _lev() -> Any:
-            return x.update_leverage(leverage, coin, True)
+            return x.update_leverage(leverage, coin, self.settings.is_cross_margin)
 
         try:
             self._retry(_lev)
@@ -540,8 +541,7 @@ class LiveBroker(_BrokerBase):
         super().__init__(settings, exchange)
         self._sync_equity()
         self._reconcile_positions()
-        for sym in settings.symbols:
-            exchange.set_leverage(int(settings.max_leverage), sym)
+        apply_account_leverage(exchange, settings, settings.symbols)
 
     def _sync_equity(self) -> None:
         try:

@@ -332,8 +332,38 @@ def request_hedge(
     return {"ok": True, "action": "arm", "symbol": resolved, "state": REQUESTED, "note": state.note}
 
 
-def request_close(settings: Settings, by: str = "telegram") -> dict[str, Any]:
-    """Ask the bot loop to flatten whatever the hedge currently holds."""
+_CLOSE_TARGETS = {
+    "": "all",
+    "all": "all",
+    "both": "all",
+    "flatten": "all",
+    "long": "long",
+    "buy": "long",
+    "short": "short",
+    "sell": "short",
+    "winner": "winner",
+}
+
+
+def request_close(
+    settings: Settings,
+    target: str = "all",
+    by: str = "telegram",
+) -> dict[str, Any]:
+    """Ask the bot loop to abort, cut one side, or bank the winner.
+
+    ``all`` flattens every open leg (abort). ``long`` / ``short`` cuts that
+    side as the loser and leaves the other trailing — the same promotion a
+    stop-hit uses. ``winner`` banks the surviving leg after a cut.
+    """
+    key = (target or "all").strip().lower()
+    resolved = _CLOSE_TARGETS.get(key)
+    if resolved is None:
+        return {
+            "ok": False,
+            "error": "Usage: /hedge close [long|short|winner]  (omit for flatten both)",
+        }
+
     logs = settings.logs_dir
     state = active_hedge(logs)
     if state is None:
@@ -344,6 +374,48 @@ def request_close(settings: Settings, by: str = "telegram") -> dict[str, Any]:
         state.closed_at = _iso(_utc_now())
         write_hedge(logs, state)
         return {"ok": True, "action": "disarm", "symbol": state.symbol, "state": state.state}
+
+    if resolved == "winner":
+        if state.state != CUT or not state.winner:
+            return {"ok": False, "error": "no winner yet; wait for a cut or /hedge close long|short"}
+        state.cut_reason = f"manual_close_winner_by_{by}"
+        write_hedge(logs, state)
+        return {
+            "ok": True,
+            "action": "close_winner",
+            "symbol": state.symbol,
+            "state": state.state,
+            "detail": f"the bot will close the {state.winner} winner on its next poll",
+        }
+
+    if resolved in (LONG, SHORT):
+        if state.state == CUT:
+            if state.winner != resolved:
+                return {
+                    "ok": False,
+                    "error": f"{resolved} already cut; the winner is {state.winner}",
+                }
+            state.cut_reason = f"manual_close_winner_by_{by}"
+            write_hedge(logs, state)
+            return {
+                "ok": True,
+                "action": "close_winner",
+                "symbol": state.symbol,
+                "state": state.state,
+                "detail": f"the bot will close the {resolved} winner on its next poll",
+            }
+        state.cut_reason = f"manual_cut:{resolved}_by_{by}"
+        write_hedge(logs, state)
+        return {
+            "ok": True,
+            "action": "cut",
+            "symbol": state.symbol,
+            "state": state.state,
+            "detail": (
+                f"the bot will close the {resolved} leg and trail the other "
+                "on its next poll"
+            ),
+        }
 
     state.cut_reason = f"manual_close_by_{by}"
     write_hedge(logs, state)

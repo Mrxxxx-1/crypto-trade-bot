@@ -52,7 +52,9 @@ HELP_TEXT = (
     "/resume — allow new entries again\n"
     "/hedge — catalyst hedge status\n"
     "/hedge arm BTC [note] — open mirrored long+short before an event\n"
-    "/hedge close — flatten the hedge now\n"
+    "/hedge close — flatten both legs now (abort)\n"
+    "/hedge close long|short — cut that leg; the other becomes the winner and trails\n"
+    "/hedge close winner — bank the surviving leg after a cut\n"
     "/help — this message\n\n"
     "Or just ask in plain language (e.g. \"how did we do today?\", \"stop buying\")."
 )
@@ -239,7 +241,8 @@ def _handle_hedge(settings: Settings, args: list[str]) -> str:
         return _fmt_hedge(hedge.hedge_status(settings))
 
     if sub in ("close", "disarm", "flatten", "cancel"):
-        return _fmt_hedge(hedge.request_close(settings, by="telegram"))
+        target = args[1] if len(args) > 1 else "all"
+        return _fmt_hedge(hedge.request_close(settings, target=target, by="telegram"))
 
     if sub == "arm":
         if len(args) < 2:
@@ -249,7 +252,7 @@ def _handle_hedge(settings: Settings, args: list[str]) -> str:
         note = " ".join(args[2:])
         return _fmt_hedge(hedge.request_hedge(settings, symbol, note=note, by="telegram"))
 
-    return "Usage: /hedge [status|arm <symbol> [note]|close]"
+    return "Usage: /hedge [status|arm <symbol> [note]|close [long|short|winner]]"
 
 
 def _handle_slash(settings: Settings, text: str) -> str | None:
