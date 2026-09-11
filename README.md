@@ -458,6 +458,10 @@ data/
 
 See [GCP_DEPLOYMENT.md](GCP_DEPLOYMENT.md) for a step-by-step guide to run the bot 24/7 on a GCP VM with systemd auto-restart and log rotation.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Warning
 
 This is educational software, not financial advice. Futures trading with leverage can result in rapid losses. Always test in paper mode first and use small sizes when transitioning to live.
