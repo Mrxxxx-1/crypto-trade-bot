@@ -41,7 +41,9 @@ jobs:
   deploy:
     name: Deploy to GCP
     needs: ci
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Off unless the repo variable DEPLOY_ENABLED is 'true' (Settings > Secrets and
+    # variables > Actions > Variables), so merges stay green while no server is running.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: production
     steps:

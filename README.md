@@ -15,6 +15,7 @@ hedge-only mode:
 |-----------|--------------|
 | `trend` (default) | EMA/ATR trend-following, described below. The only strategy that trades on its own. |
 | `hedge` | Trades nothing. Services only the [manual catalyst hedge](#catalyst-hedge-manual-and-opt-in). |
+| `copy` | Mirrors another trader's perp positions on every dex. [Paper or testnet only](#strategycopy--paper-copy-trading). |
 
 A symbol listed in `SHORT_SYMBOLS` trades the mirror (short) logic; everything
 else is long. You can instead set
@@ -96,6 +97,150 @@ Backtest (22 months, 4h BTC/ETH, `STRATEGY=trend`): **+11.7%** return, **1.27**
 profit factor, **16.4%** max drawdown — a ~35% win rate with average win ≈ 2.4×
 average loss. Backtested, not live; figures depend on the window and parameters.
 
+### `STRATEGY=copy` — paper copy trading
+
+Mirrors one trader's perp positions into a paper account. Pick the trader with
+[`leader_scan`](#4b-score-traders-to-copy-research-only). It runs on paper or on
+[testnet](#testnet-copy-trading-real-orders-fake-money), and never sends mainnet orders.
+
+```powershell
+$env:MODE="paper"; $env:STRATEGY="copy"; $env:COPY_LEADER="0x..."; $env:LOGS_DIR="logs/copy"
+python -m src.main
+```
+
+Every `COPY_POLL_SECONDS` the bot reads the leader's positions on the core book **and every
+HIP-3 builder dex** (`xyz:` stocks and indices, etc.). For each coin whose position changed, it
+trades to `leader_size × COPY_SCALE × (our equity ÷ leader equity)`.
+
+| Behaviour | Why |
+|---|---|
+| Trades only when the leader's size changes | Both equities move every tick. Chasing the exact ratio would churn fees; reacting to their trades reproduces them one for one. |
+| Joins open positions at startup (`COPY_SYNC_ON_START`) | `false` instead ignores them until the leader is next flat in that coin. |
+| Closes any coin the leader doesn't hold | A restart or a missed poll can never leave you exposed to something they aren't. |
+| Skips orders under `COPY_MIN_NOTIONAL` ($10) | Hyperliquid would reject them live. A position that would shrink below it closes instead. |
+| Pause and `COPY_RISK_GUARDS` block increases only | Reductions, closes and flips always follow. `COPY_RISK_GUARDS=false` (default) follows exactly. |
+| `MAX_LEVERAGE` caps total notional ÷ equity | Proportional copying reproduces the leader's *account* leverage, which is usually far below this cap. |
+
+**Paper fills** happen at the dex mid ± `SLIPPAGE_BPS` and pay `COPY_TAKER_FEE_BPS` (core) or
+`COPY_HIP3_FEE_BPS` (builder dexes). Hourly funding accrues at the live rate. Liquidation is not
+simulated. State (positions, cash, last-seen leader book) persists in `LOGS_DIR/copy_state.json`,
+so a restart resumes instead of re-buying. Switching `COPY_LEADER` archives the old state and
+starts clean.
+
+**Size matters.** At $10k against a $4.6M leader the ratio is about 0.2%, so any leader order
+under about $4.6k is below the $10 minimum and gets skipped (logged as `copy_skip`). Raise
+`INITIAL_EQUITY` to see a closer copy.
+
+**Not copied:** spot holdings and vault deposits. Leverage *settings* are not mirrored either;
+only the position sizes are, which determine actual exposure.
+
+#### `COPY_MODE=mirror` — exact replica of the leader's P&L (paper)
+
+The default `COPY_MODE=positions` trades like a real follower: late, at its own prices, and never
+below the $10 minimum. `COPY_MODE=mirror` instead replays **every fill** the leader makes, in
+execution order, scaled by one ratio fixed at startup:
+
+    ratio = COPY_SCALE × INITIAL_EQUITY ÷ leader equity at start
+
+Each mirrored fill uses the leader's own price and fee × ratio. Funding is the leader's actual
+payments × ratio. There's no minimum order and no rounding, so from the moment it starts:
+
+- **Mirror P&L = leader trading P&L × ratio**, to the cent.
+- **Mirror P&L % = the leader's P&L as a % of their starting equity.**
+- Every order is tracked, including ones opened and closed between polls, which position polling
+  would miss.
+
+```powershell
+$env:MODE='paper'; $env:STRATEGY='copy'; $env:COPY_MODE='mirror'; $env:COPY_LEADER='0x...'; $env:LOGS_DIR='logs/copy-mirror'
+python -m src.main
+```
+
+Positions the leader already holds at startup are joined at the current mark. Leader deposits and
+withdrawals don't change the ratio, because they aren't trading. If a fill's `startPosition`
+doesn't match the size the mirror tracked (it missed fills while stopped), it resyncs and logs
+`mirror_resync`. A check against the leader's live book every ~minute catches anything the fill
+feed hasn't delivered. The pause flag is ignored, because pausing would break the replica.
+`MODE=live` refuses it: this is a ledger, not an executor.
+
+Run it alongside a `positions` copy (paper or testnet) to see what real execution costs against
+the perfect replica.
+
+#### Testnet copy trading (real orders, fake money)
+
+`MODE=live` + `HL_TESTNET=true` sends real IOC orders to **Hyperliquid testnet** while still
+reading the leader from mainnet. `MODE=live` without `HL_TESTNET=true` refuses to start:
+copy trading never sends mainnet orders.
+
+| What changes vs paper | Detail |
+|---|---|
+| Sizing | Your **testnet** equity ÷ leader equity × `COPY_SCALE`. |
+| Orders | Aggressive limit IOC, at most `COPY_MAX_SLIPPAGE_BPS` (default 100) from the testnet mid. Reductions and closes are `reduce_only`. Failed or unfilled orders are logged as `copy_order_error`; partial fills are booked at the size that filled. |
+| Truth | Your testnet positions and equity are read from the exchange each tick. The local ledger (for `trades.jsonl`) is reconciled to them, logged as `copy_reconcile`. |
+| Markets | Only the leader's dexes that exist on testnet are loaded (today: core, `xyz`, `flx`, `hyna`, `abcd`). A coin testnet doesn't list is skipped once, as `copy_skip`. Testnet prices drift from mainnet, so fills won't match the leader's prices. |
+
+**Setup** (the private key is yours to handle; keep it out of chat and out of git):
+
+1. Open the Hyperliquid **testnet** app and claim mock USDC from its faucet. Hyperliquid's faucet
+   needs the address to have deposited on mainnet, so use your existing address.
+2. Create an **API wallet** for that address in the testnet app. It can trade but can't withdraw.
+3. Create `.env.testnet` (git-ignored, like every `.env.*` except `.env.example`):
+
+   ```ini
+   MODE=live
+   HL_TESTNET=true
+   STRATEGY=copy
+   HL_WALLET_ADDRESS=0x...   # your main address (the account that holds the USDC)
+   HL_PRIVATE_KEY=0x...      # the testnet API wallet's key, not your main key
+   COPY_LEADER=0x8bcf7a888c66f635ac4a2caf42a8dd12a3b20b14
+   COPY_SCALE=10             # ~$1k faucet balance x10 = the same ratio as a $10k paper copy
+   LOGS_DIR=logs/copy-testnet
+   KEEP_AWAKE=true
+   TELEGRAM_CONTROL_ENABLED=false
+   DAILY_BRIEFING_ENABLED=false
+   HEDGE_ENABLED=false
+   ```
+
+4. Run it, pointing the bot at that file:
+
+   ```powershell
+   $env:ENV_FILE = '.env.testnet'; .\.venv\Scripts\python.exe -m src.main
+   ```
+
+**Use a testnet account that does nothing else.** The copier closes any position the leader
+doesn't hold, including ones you opened by hand. If HIP-3 (`xyz:` etc.) orders fail with a margin
+error, that dex's collateral isn't set up for your testnet account. Core coins keep working.
+
+#### Reading the copy bot's terminal
+
+Copy mode (paper or testnet) doesn't print the trend bot's `HEARTBEAT`. It prints three kinds of
+line:
+
+```
+[2026-11-26 04:31:02Z] COPY ETH          leader bought 50 -> long 250 | we bought 0.0386 @ 1733.1 (4.0 bps slip) -> long 0.1929
+[2026-11-26 04:31:40Z] COPY xyz:NVDA     leader bought 3 -> long 13 | skipped: order $6.12 below $10 minimum
+[2026-11-26 04:35:00Z] STATUS equity $445.65 | me +0.04%  leader +0.05%  gap -0.01% since 11-26 04:21Z | copied 3  skipped 1  failed 0  avg slip 6.0 bps
+  ETH          leader long 200 ($339.3k, 7.4%, 20x)     | me long 0.1543 ($267.40, 60.0%) uPnL +$0.12
+[2026-11-27 00:00:04Z] DAILY 2026-11-26: me +0.40%  leader +0.35%  gap +0.05% | copied 4  skipped 2  failed 0  avg slip 5.0 bps
+```
+
+- **COPY**: one line the moment the leader changes a position. It shows what the leader did and
+  what the bot did about it: filled (with slippage against the mid), skipped (and why) or FAILED.
+- **STATUS**: printed every `COPY_STATUS_SECONDS` (default 300) and right after any COPY line.
+  `gap` is your return minus the leader's times `COPY_SCALE` (shown as `x10 = ...`), since the bot first started on this `LOGS_DIR`. The
+  leader's return is their account-value change, so their deposits and withdrawals show up in it.
+  Each coin's `%` is its size as a share of that account's equity, so with `COPY_SCALE=10` yours
+  is about 10 times theirs.
+- **DAILY**: at the first tick after midnight UTC, the previous day's returns and counts.
+
+The scorecard is kept in `copy_state.json`, so it survives restarts.
+
+### Keeping the PC awake
+
+`KEEP_AWAKE=true` makes the bot ask Windows not to idle-sleep while it runs
+(`SetThreadExecutionState`). Your power settings don't change, and the hold ends when the bot
+stops. A closed lid or an explicit Sleep still sleeps. No effect on macOS/Linux; wrap the process
+with `caffeinate` or `systemd-inhibit` there.
+
 ### Entry-quality filters (opt-in)
 
 Three filters can tighten entries. **All are disabled by default**, so the
@@ -174,6 +319,47 @@ python -m src.backtest --env .env --label SIGNAL --set DIRECTION_MODE=signal
 Use `--env .env` (not the `.env.example` default) so the run uses your live
 parameters. `--set` accepts any setting name; comma-separated lists such as
 `SYMBOLS` and `SHORT_SYMBOLS` are parsed as lists.
+
+### 4b. Score traders to copy (research only)
+
+`src/leader_scan.py` ranks Hyperliquid traders as copy-trading candidates. It only
+reads public data: no credentials, no orders.
+
+```powershell
+python -m src.leader_scan                        # deep-scan 40, report top 10
+python -m src.leader_scan --deep 80 --days 90 --refresh
+```
+
+It writes `data/leader_scan.md` (top N with details and explorer links) and
+`data/leader_scan.json` (every qualifier).
+
+1. **Prefilter** the public leaderboard (cached 12h in `data/`): drop vaults, accounts
+   losing this month or all-time, equity outside `--min-equity`/`--max-equity`, and monthly
+   volume above `--max-turnover` × equity (market makers and scalpers).
+2. **Deep-scan** the best survivors by all-time P&L, rate-limited under Hyperliquid's
+   info-API budget. It reads the account's own equity and open positions, its perp P&L history
+   (drawdown, profitable months) and `--days` of fills (round trips, hold time, maker share).
+3. **Charge a copy cost.** Every fill pays `--copy-cost-bps` (default 5) on its notional:
+   the slippage a follower takes by arriving late. Win rate, profit factor and ROI are all
+   reported *after* this cost.
+4. **Reject** anything a follower can't reproduce:
+
+| Reason | Why |
+|---|---|
+| trades via sub-accounts | The leaderboard sums sub-accounts into the master. When the sub-accounts hold more than the master's own perp and spot-stablecoin equity, the trading happens at other addresses. |
+| own equity below `--min-equity` | The profits were withdrawn. There's nothing left to size against. |
+| too active to copy | More fills in the window than `--max-fills`. |
+| too few round trips | Under `--min-trades`. Not enough data to judge. |
+| holds too short | Median hold under `--min-hold-hours`. Copy delay eats the edge. |
+| mostly maker fills | Over `--max-maker-ratio` of notional rested on the book. That is market making, and a taker copy can't earn it. |
+| unprofitable after copy cost | Its edge is smaller than the delay. |
+
+5. **Score** 0–100: edge (profit factor, 30), monthly consistency (20), drawdown (20),
+   breadth, meaning P&L not concentrated in the best 3 trades (15), and window ROI (15).
+
+Caveats: Hyperliquid samples P&L history every few days, so intraday drawdowns are
+understated. A trader may also be hedged on another exchange you can't see. If a
+candidate runs a vault, the report says so; depositing copies them exactly, with no delay.
 
 ### 5. Run the bot
 
@@ -425,6 +611,10 @@ src/
   models.py         Shared types: Position, Leg, TradeResult
   backtest.py       Offline backtester on cached candle data
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
+  leader_scan.py    Score leaderboard traders as copy-trading candidates (read-only)
+  copy_trade.py     STRATEGY=copy: mirror a leader across all perp dexes (paper or testnet)
+  copy_mirror.py    COPY_MODE=mirror: exact fill-by-fill replica of the leader's P&L
+  keep_awake.py     KEEP_AWAKE=true: block Windows idle sleep while the bot runs
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)
   agent_tools.py    Single registry of agent-callable tools (read + pause/resume only)

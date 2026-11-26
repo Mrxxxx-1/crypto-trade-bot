@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
-from . import control, hedge, hedge_broker, log_hygiene
+from . import control, copy_mirror, copy_trade, hedge, hedge_broker, log_hygiene
 from . import direction as direction_mod
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
@@ -37,14 +37,46 @@ class FuturesBot:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.exchange = ExchangeAdapter(settings)
+        is_copy = settings.strategy == "copy"
+        if is_copy and settings.copy_mode == "mirror" and settings.is_live:
+            raise RuntimeError(
+                "COPY_MODE=mirror is a paper ledger (no minimum order, leader's own prices): "
+                "it can't place orders. Use MODE=paper, or COPY_MODE=positions on testnet."
+            )
+        if is_copy and settings.is_live and not settings.testnet:
+            raise RuntimeError(
+                "STRATEGY=copy never trades mainnet. Use MODE=paper, or MODE=live with "
+                "HL_TESTNET=true to send real orders to Hyperliquid testnet."
+            )
+        # Copy mode talks to the info API directly and never needs the SDK
+        # adapter, unless the manual hedge (which trades through it) is on.
+        self.exchange: ExchangeAdapter | None = (
+            ExchangeAdapter(settings) if not is_copy or settings.hedge_enabled else None
+        )
+        self.copy: copy_trade.CopyTrader | None = None
         # Broker first: LiveBroker syncs real account equity in its constructor,
         # which is the baseline the drawdown guard has to measure against.
         # PaperBroker leaves it at INITIAL_EQUITY.
-        if settings.is_live:
-            self.broker: PaperBroker | LiveBroker = LiveBroker(settings, self.exchange)
+        if is_copy:
+            self.broker: PaperBroker | LiveBroker | copy_trade.CopyPaperBroker = copy_trade.CopyPaperBroker(settings)
+        elif settings.is_live:
+            self.broker = LiveBroker(settings, self.exchange)
         else:
             self.broker = PaperBroker(settings, self.exchange)
+        if settings.strategy == "copy" and settings.copy_mode == "mirror":
+            assert isinstance(self.broker, copy_trade.CopyPaperBroker)
+            self.copy = copy_mirror.MirrorTracker(settings, self.broker)  # type: ignore[assignment]
+        elif settings.strategy == "copy":
+            assert isinstance(self.broker, copy_trade.CopyPaperBroker)
+            venue, executor = copy_trade.build_testnet(settings) if settings.is_live else (None, None)
+            self.copy = copy_trade.CopyTrader(
+                settings,
+                self.broker,
+                on_trade_close=lambda t: self.risk.on_trade_close(t.pnl, self.broker.equity),
+                can_increase=lambda: not settings.copy_risk_guards or self.risk.can_trade(self.broker.equity),
+                venue=venue,
+                executor=executor,
+            )
         self.starting_equity = self.broker.equity
         self.risk = RiskManager(settings, starting_equity=self.broker.equity)
         self.loop_count = 0
@@ -73,6 +105,8 @@ class FuturesBot:
         Consumed by the dashboard / MCP / Telegram read layer so they always
         report the bot's actual current positions (not parsed from text).
         """
+        if isinstance(self.broker, copy_trade.CopyPaperBroker):
+            return self.broker.snapshot()
         snap = []
         for symbol, pos in self.broker.positions.items():
             snap.append(
@@ -243,11 +277,16 @@ class FuturesBot:
 
     def run_forever(self) -> None:
         """Main loop: process all symbols, sleep, log heartbeats."""
-        print(
-            f"[{self._utc_now()}] Start bot mode={self.settings.mode} "
-            f"symbols={self.settings.symbols} strategy={self.settings.strategy} "
-            f"timeframe={self.settings.timeframe}"
-        )
+        if self.copy is not None:  # symbols and timeframe mean nothing to a copy bot
+            venue = "testnet" if self.settings.is_live else "paper"
+            print(f"[{self._utc_now()}] Start copy bot venue={venue} copy_mode={self.settings.copy_mode}")
+        else:
+            print(
+                f"[{self._utc_now()}] Start bot mode={self.settings.mode} "
+                f"symbols={self.settings.symbols} strategy={self.settings.strategy} "
+                f"timeframe={self.settings.timeframe}"
+            )
+        last_status = 0.0
         if self.settings.strategy == "trend":
             print(
                 f"  trend: fast_ema={self.settings.fast_ema} slow_ema={self.settings.slow_ema} "
@@ -257,6 +296,9 @@ class FuturesBot:
                 f"adx_min={self.settings.adx_min} vol_mult={self.settings.volume_min_mult} "
                 f"mtf={self.settings.mtf_enabled}"
             )
+        if self.copy is not None:
+            for line in copy_trade.print_banner(self.settings):
+                print(line)
         while True:
             try:
                 self.loop_count += 1
@@ -275,7 +317,9 @@ class FuturesBot:
                         {"by": ctrl.get("by", ""), "reason": ctrl.get("reason", "")},
                     )
                 statuses = []
-                if self.settings.strategy == "hedge":
+                if self.copy is not None:
+                    statuses += self.copy.tick(self.paused)
+                elif self.settings.strategy == "hedge":
                     if self.hedge is None:
                         statuses.append("hedge-only: HEDGE_ENABLED=false or misconfigured")
                 else:
@@ -284,15 +328,22 @@ class FuturesBot:
                 hedge_status = self._poll_hedge()
                 if hedge_status:
                     statuses.append(f"hedge: {hedge_status}")
+                if self.copy is not None and (
+                    self.copy.changed or time.monotonic() - last_status >= self.settings.copy_status_seconds
+                ):
+                    for line in self.copy.heartbeat_lines(self.paused):
+                        print(line)
+                    last_status = time.monotonic()
                 if self.loop_count % self.settings.heartbeat_interval == 0:
-                    print(
-                        f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
-                        f"equity={self.broker.equity:.2f} "
-                        f"open_positions={len(self.broker.positions)}"
-                        f"{' [PAUSED]' if self.paused else ''}"
-                    )
-                    for status in statuses:
-                        print(f"  - {status}")
+                    if self.copy is None:
+                        print(
+                            f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
+                            f"equity={self.broker.equity:.2f} "
+                            f"open_positions={len(self.broker.positions)}"
+                            f"{' [PAUSED]' if self.paused else ''}"
+                        )
+                        for status in statuses:
+                            print(f"  - {status}")
                     snapshot = {
                         "loop": self.loop_count,
                         "equity": self.broker.equity,
@@ -304,12 +355,14 @@ class FuturesBot:
                     if self.settings.hedge_enabled:
                         active = hedge.read_hedge(self.settings.logs_dir)
                         snapshot["hedge"] = active.to_dict() if active else None
+                    if self.copy is not None:
+                        snapshot["copy"] = self.copy.summary()
                     log_hygiene.write_state_snapshot(
                         self.settings.logs_dir,
                         {"ts": self._utc_now(), "event": "heartbeat", **snapshot},
                     )
                     self.broker.log_event("heartbeat", self._heartbeat_log.thin(snapshot))
-                time.sleep(self.settings.poll_seconds)
+                time.sleep(self._poll_interval())
             except KeyboardInterrupt:
                 print("Stopped by user.")
                 break
@@ -323,4 +376,7 @@ class FuturesBot:
                         "type": type(exc).__name__,
                     },
                 )
-                time.sleep(max(3, self.settings.poll_seconds // 2))
+                time.sleep(max(3, self._poll_interval() // 2))
+
+    def _poll_interval(self) -> int:
+        return self.settings.copy_poll_seconds if self.copy is not None else self.settings.poll_seconds
