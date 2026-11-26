@@ -17,8 +17,11 @@ from src.copy_trade import (
     AssetCtx,
     CopyPaperBroker,
     CopyTrader,
+    Execution,
     LeaderBook,
+    TestnetExecutor,
     dex_of,
+    parse_order_response,
     plan_orders,
 )
 from tests.helpers import make_settings
@@ -199,7 +202,44 @@ class FakeClient:
         return LeaderBook(self.book.equity, dict(self.book.positions))
 
     def ctx(self, coin):
+        if coin not in self.px:
+            raise KeyError(coin)
         return AssetCtx(mid=self.px[coin], oracle=self.px[coin], funding=self.funding, sz_decimals=DEC[coin])
+
+    def has(self, coin):
+        return coin in self.px
+
+
+class FakeVenue(FakeClient):
+    """Testnet stand-in: our account lives here; ``leader(addr)`` returns it."""
+
+    def __init__(self, equity=1_000.0):
+        super().__init__()
+        self.account = LeaderBook(equity=equity, positions={})
+
+    def leader(self, address):
+        return LeaderBook(self.account.equity, dict(self.account.positions))
+
+
+class FakeExecutor:
+    address = "0x" + "ee" * 20
+
+    def __init__(self, venue, fill_fraction=1.0, error=""):
+        self.venue = venue
+        self.fill_fraction = fill_fraction
+        self.error = error
+        self.calls = []
+
+    def place(self, coin, delta, reduce_only, mid):
+        self.calls.append((coin, delta, reduce_only))
+        if self.error:
+            return Execution(0.0, 0.0, self.error)
+        filled = round(delta * self.fill_fraction, 8)
+        pos = self.venue.account.positions
+        pos[coin] = round(pos.get(coin, 0.0) + filled, 8)
+        if abs(pos[coin]) < 1e-12:
+            del pos[coin]
+        return Execution(filled, mid * 1.001 if delta > 0 else mid * 0.999)
 
 
 class TestCopyTrader(unittest.TestCase):
@@ -255,14 +295,112 @@ class TestCopyTrader(unittest.TestCase):
                        CopyPaperBroker(self.settings), client=self.client)
 
 
+class TestTestnetTrader(unittest.TestCase):
+    LEADER = "0x" + "ab" * 20
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.settings = make_settings(
+            STRATEGY="copy", MODE="live", HL_TESTNET="true", COPY_LEADER=self.LEADER,
+            LOGS_DIR=self.tmp.name, COPY_TAKER_FEE_BPS=0, COPY_HIP3_FEE_BPS=0, MAX_LEVERAGE=50,
+        )
+        self.leader = FakeClient()  # $1M leader on mainnet
+        self.venue = FakeVenue(equity=1_000.0)  # our $1k testnet account -> ratio 0.001
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def trader(self, executor):
+        return CopyTrader(
+            self.settings, CopyPaperBroker(self.settings), client=self.leader, venue=self.venue, executor=executor
+        )
+
+    def events(self, name):
+        path = Path(self.tmp.name) / "events.jsonl"
+        return [e for e in map(json.loads, path.read_text().splitlines()) if e["event"] == name]
+
+    def test_orders_carry_reduce_only_only_when_shrinking(self):
+        ex = FakeExecutor(self.venue)
+        t = self.trader(ex)
+        self.leader.book.positions = {"ETH": 100.0}
+        t.tick(paused=False)
+        self.leader.book.positions = {"ETH": 50.0}
+        t.tick(paused=False)
+        self.leader.book.positions = {"ETH": -50.0}
+        t.tick(paused=False)
+        self.leader.book.positions = {}
+        t.tick(paused=False)
+        self.assertEqual(
+            ex.calls,
+            [("ETH", 0.1, False), ("ETH", -0.05, True), ("ETH", -0.1, False), ("ETH", 0.05, True)],
+        )
+        self.assertEqual(self.venue.account.positions, {})
+        self.assertEqual(t.broker.positions, {})
+        self.assertEqual(t.summary()["venue"], "testnet")
+
+    def test_partial_fill_is_booked_as_filled(self):
+        ex = FakeExecutor(self.venue, fill_fraction=0.5)
+        t = self.trader(ex)
+        self.leader.book.positions = {"ETH": 100.0}
+        t.tick(paused=False)
+        self.assertAlmostEqual(t.broker.positions["ETH"].size, 0.05)
+        self.assertEqual(self.events("copy_fill")[0]["requested"], 0.1)
+
+    def test_failed_order_is_logged_not_booked(self):
+        t = self.trader(FakeExecutor(self.venue, error="Insufficient margin"))
+        self.leader.book.positions = {"ETH": 100.0}
+        statuses = t.tick(paused=False)
+        self.assertEqual(t.broker.positions, {})
+        self.assertIn("Insufficient margin", self.events("copy_order_error")[0]["error"])
+        self.assertTrue(any("FAILED" in s for s in statuses))
+
+    def test_ledger_reconciles_to_the_exchange(self):
+        t = self.trader(FakeExecutor(self.venue))
+        self.leader.book.positions = {"ETH": 100.0}
+        t.tick(paused=False)
+        self.venue.account.positions["ETH"] = 0.07  # someone touched the account by hand
+        t.tick(paused=False)
+        self.assertAlmostEqual(t.broker.positions["ETH"].size, 0.07)
+        self.assertEqual(self.events("copy_reconcile")[-1]["exchange"], 0.07)
+
+    def test_coin_missing_on_testnet_is_skipped_once(self):
+        t = self.trader(FakeExecutor(self.venue))
+        del self.venue.px["DOGE"]
+        self.leader.book.positions = {"DOGE": 500_000.0, "ETH": 100.0}
+        t.tick(paused=False)
+        t.tick(paused=False)
+        skips = [e for e in self.events("copy_skip") if "not listed" in e["reason"]]
+        self.assertEqual(len(skips), 1)
+        self.assertIn("ETH", t.broker.positions)
+
+
+class TestOrderResponse(unittest.TestCase):
+    def test_filled(self):
+        resp = {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"filled": {"totalSz": "0.02", "avgPx": "1891.4", "oid": 1}}]}}}
+        self.assertEqual(parse_order_response(resp, is_buy=False), Execution(-0.02, 1891.4))
+
+    def test_errors(self):
+        resp = {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"error": "Order could not immediately match against any resting orders."}]}}}
+        self.assertIn("immediately match", parse_order_response(resp, True).error)
+        self.assertIn("bad", parse_order_response({"status": "err", "response": "bad nonce"}, True).error)
+
+
 class TestBotGate(unittest.TestCase):
-    def test_copy_refuses_live_mode(self):
+    def test_copy_refuses_mainnet_live(self):
         from src.bot import FuturesBot
 
         with tempfile.TemporaryDirectory() as tmp:
             s = make_settings(STRATEGY="copy", MODE="live", COPY_LEADER="0x" + "ab" * 20, LOGS_DIR=tmp)
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, "never trades mainnet"):
                 FuturesBot(s)
+
+    def test_executor_refuses_mainnet(self):
+        s = make_settings(STRATEGY="copy", MODE="live", HL_PRIVATE_KEY="0x" + "11" * 32,
+                          HL_WALLET_ADDRESS="0x" + "22" * 20)
+        with self.assertRaisesRegex(RuntimeError, "HL_TESTNET"):
+            TestnetExecutor(s, [""])
 
 
 if __name__ == "__main__":

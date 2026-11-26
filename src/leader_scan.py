@@ -239,7 +239,10 @@ def round_trips(fills: Iterable[dict[str, Any]]) -> tuple[list[RoundTrip], list[
     done: list[RoundTrip] = []
     still_open: list[RoundTrip] = []
     for coin, cf in by_coin.items():
-        cf.sort(key=lambda f: (int(f["time"]), int(f.get("tid", 0))))
+        # Stable sort by time only: the API already returns fills in execution
+        # order, and trade ids are NOT sequential within one millisecond, so a
+        # tid tiebreak scrambles same-ms fills (334 of 439 broke the chain).
+        cf.sort(key=lambda f: int(f["time"]))
         trip: Optional[RoundTrip] = None
         for f in cf:
             t = int(f["time"])
@@ -461,8 +464,11 @@ class InfoClient:
 
     WEIGHTS = {"clearinghouseState": 2, "spotClearinghouseState": 2, "portfolio": 20, "subAccounts": 20, "userFillsByTime": 20}
 
-    def __init__(self, budget: int = 900, session: Optional[requests.Session] = None) -> None:
+    def __init__(
+        self, budget: int = 900, session: Optional[requests.Session] = None, url: str = INFO_URL
+    ) -> None:
         self.budget = budget
+        self.url = url
         self.session = session or requests.Session()
         self._spent: list[tuple[float, int]] = []
 
@@ -478,7 +484,7 @@ class InfoClient:
     def post(self, body: dict[str, Any]) -> Any:
         self._charge(self.WEIGHTS.get(body["type"], 20))
         for attempt in range(6):
-            resp = self.session.post(INFO_URL, json=body, timeout=30)
+            resp = self.session.post(self.url, json=body, timeout=30)
             if resp.status_code == 429:
                 time.sleep(5 * (attempt + 1))
                 continue

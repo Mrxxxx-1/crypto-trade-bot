@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
-from . import control, copy_trade, hedge, hedge_broker, log_hygiene
+from . import control, copy_mirror, copy_trade, hedge, hedge_broker, log_hygiene
 from . import direction as direction_mod
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
@@ -38,10 +38,15 @@ class FuturesBot:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         is_copy = settings.strategy == "copy"
-        if is_copy and settings.is_live:
+        if is_copy and settings.copy_mode == "mirror" and settings.is_live:
             raise RuntimeError(
-                "STRATEGY=copy is paper-only: live order routing for copy trading "
-                "is not built. Set MODE=paper."
+                "COPY_MODE=mirror is a paper ledger (no minimum order, leader's own prices): "
+                "it can't place orders. Use MODE=paper, or COPY_MODE=positions on testnet."
+            )
+        if is_copy and settings.is_live and not settings.testnet:
+            raise RuntimeError(
+                "STRATEGY=copy never trades mainnet. Use MODE=paper, or MODE=live with "
+                "HL_TESTNET=true to send real orders to Hyperliquid testnet."
             )
         # Copy mode talks to the info API directly and never needs the SDK
         # adapter, unless the manual hedge (which trades through it) is on.
@@ -58,13 +63,19 @@ class FuturesBot:
             self.broker = LiveBroker(settings, self.exchange)
         else:
             self.broker = PaperBroker(settings, self.exchange)
-        if settings.strategy == "copy":
+        if settings.strategy == "copy" and settings.copy_mode == "mirror":
             assert isinstance(self.broker, copy_trade.CopyPaperBroker)
+            self.copy = copy_mirror.MirrorTracker(settings, self.broker)  # type: ignore[assignment]
+        elif settings.strategy == "copy":
+            assert isinstance(self.broker, copy_trade.CopyPaperBroker)
+            venue, executor = copy_trade.build_testnet(settings) if settings.is_live else (None, None)
             self.copy = copy_trade.CopyTrader(
                 settings,
                 self.broker,
                 on_trade_close=lambda t: self.risk.on_trade_close(t.pnl, self.broker.equity),
                 can_increase=lambda: not settings.copy_risk_guards or self.risk.can_trade(self.broker.equity),
+                venue=venue,
+                executor=executor,
             )
         self.starting_equity = self.broker.equity
         self.risk = RiskManager(settings, starting_equity=self.broker.equity)

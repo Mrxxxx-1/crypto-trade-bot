@@ -15,7 +15,7 @@ hedge-only mode:
 |-----------|--------------|
 | `trend` (default) | EMA/ATR trend-following, described below. The only strategy that trades on its own. |
 | `hedge` | Trades nothing. Services only the [manual catalyst hedge](#catalyst-hedge-manual-and-opt-in). |
-| `copy` | Mirrors another trader's perp positions on every dex. [Paper only](#strategycopy--paper-copy-trading). |
+| `copy` | Mirrors another trader's perp positions on every dex. [Paper or testnet only](#strategycopy--paper-copy-trading). |
 
 A symbol listed in `SHORT_SYMBOLS` trades the mirror (short) logic; everything
 else is long. You can instead set
@@ -100,8 +100,8 @@ average loss. Backtested, not live; figures depend on the window and parameters.
 ### `STRATEGY=copy` — paper copy trading
 
 Mirrors one trader's perp positions into a paper account. Pick the trader with
-[`leader_scan`](#4b-score-traders-to-copy-research-only). `MODE=live` refuses to start:
-live order routing for copy trading isn't built.
+[`leader_scan`](#4b-score-traders-to-copy-research-only). It runs on paper or on
+[testnet](#testnet-copy-trading-real-orders-fake-money), and never sends mainnet orders.
 
 ```powershell
 $env:MODE="paper"; $env:STRATEGY="copy"; $env:COPY_LEADER="0x..."; $env:LOGS_DIR="logs/copy"
@@ -133,6 +133,89 @@ under about $4.6k is below the $10 minimum and gets skipped (logged as `copy_ski
 
 **Not copied:** spot holdings and vault deposits. Leverage *settings* are not mirrored either;
 only the position sizes are, which determine actual exposure.
+
+#### `COPY_MODE=mirror` — exact replica of the leader's P&L (paper)
+
+The default `COPY_MODE=positions` trades like a real follower: late, at its own prices, and never
+below the $10 minimum. `COPY_MODE=mirror` instead replays **every fill** the leader makes, in
+execution order, scaled by one ratio fixed at startup:
+
+    ratio = COPY_SCALE × INITIAL_EQUITY ÷ leader equity at start
+
+Each mirrored fill uses the leader's own price and fee × ratio. Funding is the leader's actual
+payments × ratio. There's no minimum order and no rounding, so from the moment it starts:
+
+- **Mirror P&L = leader trading P&L × ratio**, to the cent.
+- **Mirror P&L % = the leader's P&L as a % of their starting equity.**
+- Every order is tracked, including ones opened and closed between polls, which position polling
+  would miss.
+
+```powershell
+$env:MODE='paper'; $env:STRATEGY='copy'; $env:COPY_MODE='mirror'; $env:COPY_LEADER='0x...'; $env:LOGS_DIR='logs/copy-mirror'
+python -m src.main
+```
+
+Positions the leader already holds at startup are joined at the current mark. Leader deposits and
+withdrawals don't change the ratio, because they aren't trading. If a fill's `startPosition`
+doesn't match the size the mirror tracked (it missed fills while stopped), it resyncs and logs
+`mirror_resync`. A check against the leader's live book every ~minute catches anything the fill
+feed hasn't delivered. The pause flag is ignored, because pausing would break the replica.
+`MODE=live` refuses it: this is a ledger, not an executor.
+
+Run it alongside a `positions` copy (paper or testnet) to see what real execution costs against
+the perfect replica.
+
+#### Testnet copy trading (real orders, fake money)
+
+`MODE=live` + `HL_TESTNET=true` sends real IOC orders to **Hyperliquid testnet** while still
+reading the leader from mainnet. `MODE=live` without `HL_TESTNET=true` refuses to start:
+copy trading never sends mainnet orders.
+
+| What changes vs paper | Detail |
+|---|---|
+| Sizing | Your **testnet** equity ÷ leader equity × `COPY_SCALE`. |
+| Orders | Aggressive limit IOC, at most `COPY_MAX_SLIPPAGE_BPS` (default 100) from the testnet mid. Reductions and closes are `reduce_only`. Failed or unfilled orders are logged as `copy_order_error`; partial fills are booked at the size that filled. |
+| Truth | Your testnet positions and equity are read from the exchange each tick. The local ledger (for `trades.jsonl`) is reconciled to them, logged as `copy_reconcile`. |
+| Markets | Only the leader's dexes that exist on testnet are loaded (today: core, `xyz`, `flx`, `hyna`, `abcd`). A coin testnet doesn't list is skipped once, as `copy_skip`. Testnet prices drift from mainnet, so fills won't match the leader's prices. |
+
+**Setup** (the private key is yours to handle; keep it out of chat and out of git):
+
+1. Open the Hyperliquid **testnet** app and claim mock USDC from its faucet. Hyperliquid's faucet
+   needs the address to have deposited on mainnet, so use your existing address.
+2. Create an **API wallet** for that address in the testnet app. It can trade but can't withdraw.
+3. Create `.env.testnet` (git-ignored, like every `.env.*` except `.env.example`):
+
+   ```ini
+   MODE=live
+   HL_TESTNET=true
+   STRATEGY=copy
+   HL_WALLET_ADDRESS=0x...   # your main address (the account that holds the USDC)
+   HL_PRIVATE_KEY=0x...      # the testnet API wallet's key, not your main key
+   COPY_LEADER=0x8bcf7a888c66f635ac4a2caf42a8dd12a3b20b14
+   COPY_SCALE=10             # ~$1k faucet balance x10 = the same ratio as a $10k paper copy
+   LOGS_DIR=logs/copy-testnet
+   KEEP_AWAKE=true
+   TELEGRAM_CONTROL_ENABLED=false
+   DAILY_BRIEFING_ENABLED=false
+   HEDGE_ENABLED=false
+   ```
+
+4. Run it, pointing the bot at that file:
+
+   ```powershell
+   $env:ENV_FILE = '.env.testnet'; .\.venv\Scripts\python.exe -m src.main
+   ```
+
+**Use a testnet account that does nothing else.** The copier closes any position the leader
+doesn't hold, including ones you opened by hand. If HIP-3 (`xyz:` etc.) orders fail with a margin
+error, that dex's collateral isn't set up for your testnet account. Core coins keep working.
+
+### Keeping the PC awake
+
+`KEEP_AWAKE=true` makes the bot ask Windows not to idle-sleep while it runs
+(`SetThreadExecutionState`). Your power settings don't change, and the hold ends when the bot
+stops. A closed lid or an explicit Sleep still sleeps. No effect on macOS/Linux; wrap the process
+with `caffeinate` or `systemd-inhibit` there.
 
 ### Entry-quality filters (opt-in)
 
@@ -505,7 +588,9 @@ src/
   backtest.py       Offline backtester on cached candle data
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
   leader_scan.py    Score leaderboard traders as copy-trading candidates (read-only)
-  copy_trade.py     STRATEGY=copy: mirror a leader across all perp dexes (paper ledger)
+  copy_trade.py     STRATEGY=copy: mirror a leader across all perp dexes (paper or testnet)
+  copy_mirror.py    COPY_MODE=mirror: exact fill-by-fill replica of the leader's P&L
+  keep_awake.py     KEEP_AWAKE=true: block Windows idle sleep while the bot runs
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)
   agent_tools.py    Single registry of agent-callable tools (read + pause/resume only)

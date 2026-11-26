@@ -1,4 +1,4 @@
-"""STRATEGY=copy: mirror one Hyperliquid trader's perp positions, in paper mode.
+"""STRATEGY=copy: mirror one Hyperliquid trader's perp positions, on paper or testnet.
 
 Every ``COPY_POLL_SECONDS`` the bot reads the leader's positions on **every perp
 dex** (the core book plus each HIP-3 builder dex such as ``xyz:`` stocks) and,
@@ -26,8 +26,9 @@ Paper fills happen at the dex's mid price plus ``SLIPPAGE_BPS``, pay
 ``COPY_TAKER_FEE_BPS`` (``COPY_HIP3_FEE_BPS`` on builder dexes) and accrue
 hourly funding at the live rate. Liquidation is not simulated.
 
-Live trading is deliberately unsupported: ``FuturesBot`` refuses
-``STRATEGY=copy`` with ``MODE=live``.
+``MODE=live`` with ``HL_TESTNET=true`` sends real IOC orders to testnet through
+``TestnetExecutor`` (see the README). Mainnet copy trading is deliberately
+unsupported: ``FuturesBot`` refuses ``STRATEGY=copy`` with ``MODE=live`` on mainnet.
 """
 
 from __future__ import annotations
@@ -40,10 +41,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+import requests
+
 from . import log_hygiene
 from .config import Settings
+from .leader_scan import INFO_URL as MAINNET_INFO_URL
 from .leader_scan import STABLES, InfoClient
 from .models import TradeResult
+
+TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
 STATE_FILE = "copy_state.json"
 EPS = 1e-12
@@ -83,27 +89,45 @@ class AssetCtx:
 
 
 class CopyClient:
-    """Leader positions across all perp dexes, plus per-dex market data."""
+    """Account positions across perp dexes, plus per-dex market data, for one network.
 
-    def __init__(self, settings: Settings, info: Optional[InfoClient] = None) -> None:
+    Used twice in testnet mode: once on mainnet for the leader, once on testnet
+    for our own account and execution prices. ``dexes`` pins the dex list
+    (testnet lists hundreds of throwaway dexes; we only want the leader's).
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        info: Optional[InfoClient] = None,
+        url: str = MAINNET_INFO_URL,
+        dexes: Optional[list[str]] = None,
+    ) -> None:
         self.settings = settings
-        self.info = info or InfoClient(budget=900)
+        self.info = info or InfoClient(budget=900, url=url)
         self.info.WEIGHTS = {**self.info.WEIGHTS, "metaAndAssetCtxs": 20, "perpDexs": 20}
+        self._fixed_dexes = dexes
         self._dexes: list[str] = []
         self._dexes_at = 0.0
         self._ctx: dict[str, dict[str, AssetCtx]] = {}
 
+    def all_dexes(self) -> list[str]:
+        raw = self.info.post({"type": "perpDexs"}) or []
+        return [""] + [d["name"] for d in raw if d and d.get("name")]
+
     def dexes(self) -> list[str]:
+        if self._fixed_dexes is not None:
+            return self._fixed_dexes
         wanted = list(self.settings.copy_dexes)
         if wanted != ["all"]:
             return ["" if d in ("core", "main") else d for d in wanted]
         if not self._dexes or time.time() - self._dexes_at > 3600:
-            raw = self.info.post({"type": "perpDexs"}) or []
-            self._dexes = [""] + [d["name"] for d in raw if d and d.get("name")]
+            self._dexes = self.all_dexes()
             self._dexes_at = time.time()
         return self._dexes
 
     def leader(self, address: str) -> LeaderBook:
+        """Positions and equity of ``address`` on every dex in ``dexes()``."""
         equity = 0.0
         positions: dict[str, float] = {}
         details: dict[str, dict[str, Any]] = {}
@@ -138,7 +162,10 @@ class CopyClient:
             body: dict[str, Any] = {"type": "metaAndAssetCtxs"}
             if dex:
                 body["dex"] = dex
-            meta, ctxs = self.info.post(body)
+            try:
+                meta, ctxs = self.info.post(body)
+            except requests.HTTPError:  # this network has no such dex
+                meta, ctxs = {}, []
             table: dict[str, AssetCtx] = {}
             for u, c in zip(meta.get("universe", []), ctxs):
                 mid = c.get("midPx") or c.get("markPx") or 0
@@ -153,6 +180,79 @@ class CopyClient:
             return self._ctx[dex][coin]
         except KeyError:
             raise KeyError(f"no market data for {coin}") from None
+
+    def has(self, coin: str) -> bool:
+        try:
+            return self.ctx(coin).mid > 0
+        except KeyError:
+            return False
+
+
+# --------------------------------------------------------------------- testnet
+
+
+@dataclass
+class Execution:
+    filled: float  # signed size actually filled (0 if nothing)
+    avg_px: float
+    error: str = ""
+
+
+class TestnetExecutor:
+    """Real IOC orders on Hyperliquid **testnet**, via the official SDK.
+
+    Refuses to exist for mainnet: ``settings.testnet`` must be true. Orders are
+    aggressive limit IOCs capped at ``COPY_MAX_SLIPPAGE_BPS`` from the testnet
+    mid; reductions and closes are ``reduce_only`` so a stale view can never
+    open a position the wrong way.
+    """
+
+    def __init__(self, settings: Settings, dexes: list[str]) -> None:
+        if not settings.testnet:
+            raise RuntimeError("TestnetExecutor needs HL_TESTNET=true: copy trading never sends mainnet orders.")
+        if not settings.private_key or not settings.wallet_address:
+            raise RuntimeError("Testnet copy trading needs HL_WALLET_ADDRESS and HL_PRIVATE_KEY (testnet API wallet).")
+        from eth_account import Account
+        from hyperliquid.exchange import Exchange
+        from hyperliquid.utils.constants import TESTNET_API_URL
+
+        wallet = Account.from_key(settings.private_key)
+        address = settings.wallet_address.strip()
+        self.address = address.lower()
+        self.slippage = settings.copy_max_slippage_bps / 10_000
+        self.exchange = Exchange(
+            wallet,
+            base_url=TESTNET_API_URL,
+            account_address=address if address.lower() != wallet.address.lower() else None,
+            perp_dexs=dexes,
+            timeout=15.0,
+        )
+
+    def place(self, coin: str, delta: float, reduce_only: bool, mid: float) -> Execution:
+        is_buy = delta > 0
+        try:
+            px = self.exchange._slippage_price(coin, is_buy, self.slippage, px=mid)  # tick-rounded
+            resp = self.exchange.order(
+                coin, is_buy, abs(delta), px, order_type={"limit": {"tif": "Ioc"}}, reduce_only=reduce_only
+            )
+        except Exception as exc:  # noqa: BLE001 - one failed order must not stop the loop
+            return Execution(0.0, 0.0, f"{type(exc).__name__}: {exc}")
+        return parse_order_response(resp, is_buy)
+
+
+def parse_order_response(resp: Any, is_buy: bool) -> Execution:
+    """Read the SDK's order response into an ``Execution``."""
+    if not isinstance(resp, dict) or resp.get("status") != "ok":
+        return Execution(0.0, 0.0, str(resp.get("response") if isinstance(resp, dict) else resp)[:200])
+    statuses = (((resp.get("response") or {}).get("data") or {}).get("statuses")) or []
+    st = statuses[0] if statuses else {}
+    if "filled" in st:
+        f = st["filled"]
+        size = float(f.get("totalSz", 0) or 0)
+        return Execution(size if is_buy else -size, float(f.get("avgPx", 0) or 0))
+    if "error" in st:
+        return Execution(0.0, 0.0, str(st["error"])[:200])
+    return Execution(0.0, 0.0, f"not filled: {st}"[:200])
 
 
 # --------------------------------------------------------------------- planning
@@ -326,10 +426,17 @@ class CopyPaperBroker:
         self._write_jsonl("events.jsonl", record)
 
     # -- trading --
-    def fill(self, coin: str, delta: float, px: float, fee_bps: float, reason: str) -> list[TradeResult]:
-        """Apply one signed fill. Returns the trades it closed (two on a flip: none open)."""
+    def fill(
+        self, coin: str, delta: float, px: float, fee_bps: float, reason: str, fee: Optional[float] = None
+    ) -> list[TradeResult]:
+        """Apply one signed fill. Returns the trades it closed (two on a flip: none open).
+
+        ``fee`` (absolute, in USD) overrides ``fee_bps`` -- the mirror passes the
+        leader's actual fee, scaled.
+        """
         closed: list[TradeResult] = []
-        fee = abs(delta) * px * fee_bps / 10_000
+        if fee is None:
+            fee = abs(delta) * px * fee_bps / 10_000
         self.cash -= fee
         pos = self.positions.get(coin)
         remaining = delta
@@ -394,6 +501,13 @@ class CopyPaperBroker:
         self._write_jsonl("trades.jsonl", payload)
         return trade
 
+    def add_funding(self, coin: str, amount: float) -> None:
+        """Book a funding payment in USD (+ received, - paid)."""
+        self.cash += amount
+        pos = self.positions.get(coin)
+        if pos:
+            pos.funding += amount
+
     def apply_funding(self, coin: str, rate: float, oracle: float) -> float:
         """Hourly funding: longs pay a positive rate, shorts receive it."""
         pos = self.positions.get(coin)
@@ -403,6 +517,26 @@ class CopyPaperBroker:
         pos.funding += payment
         self.cash += payment
         return payment
+
+    def force_size(self, coin: str, size: float, px: float) -> None:
+        """Make the ledger agree with the exchange without booking P&L.
+
+        Live mode only: the exchange's positions are the truth. A mismatch means
+        an order filled differently than reported (or the account was touched by
+        hand); the ledger is corrected and the event logged, not hidden.
+        """
+        pos = self.positions.get(coin)
+        if abs(size) <= EPS:
+            self.positions.pop(coin, None)
+            return
+        if pos is None or _sign(pos.size) != _sign(size):
+            self.positions[coin] = CopyPosition(
+                coin=coin, size=size, entry=px, opened_at=self._now(), side="buy" if size > 0 else "sell",
+                max_abs=abs(size),
+            )
+        else:
+            pos.size = size
+            pos.max_abs = max(pos.max_abs, abs(size))
 
     def mark(self, marks: dict[str, float]) -> float:
         self.marks.update(marks)
@@ -445,7 +579,13 @@ class CopyPaperBroker:
 
 
 class CopyTrader:
-    """Glue: poll the leader, plan, fill on paper, accrue funding, persist."""
+    """Glue: poll the leader, plan, execute (paper or testnet), accrue funding, persist.
+
+    ``client`` reads the leader (always mainnet). ``venue`` supplies execution
+    prices and, in testnet mode, our own account; in paper mode it is the same
+    client. With an ``executor`` the exchange's positions are the truth each
+    tick and the ledger is reconciled to them; without one the ledger is.
+    """
 
     def __init__(
         self,
@@ -454,12 +594,17 @@ class CopyTrader:
         client: Optional[CopyClient] = None,
         on_trade_close: Optional[Callable[[TradeResult], None]] = None,
         can_increase: Optional[Callable[[], bool]] = None,
+        venue: Optional[CopyClient] = None,
+        executor: Optional[TestnetExecutor] = None,
     ) -> None:
         if not settings.copy_leader:
             raise ValueError("STRATEGY=copy needs COPY_LEADER=0x... in .env")
         self.settings = settings
         self.broker = broker
         self.client = client or CopyClient(settings)
+        self.venue = venue or self.client
+        self.executor = executor
+        self.venue_name = "testnet" if executor else "paper"
         self.leader_address = settings.copy_leader.lower()
         self.on_trade_close = on_trade_close or (lambda t: None)
         self.can_increase = can_increase or (lambda: True)
@@ -469,6 +614,7 @@ class CopyTrader:
         self.funding_hour: Optional[int] = None
         self.leader_equity = 0.0
         self.ratio = 0.0
+        self._unlisted: set[str] = set()
         self._state_path = Path(settings.logs_dir) / STATE_FILE
         self._load()
 
@@ -477,8 +623,8 @@ class CopyTrader:
         if not self._state_path.exists():
             return
         state = json.loads(self._state_path.read_text(encoding="utf-8"))
-        if state.get("leader") != self.leader_address:
-            # A different leader: the old book means nothing. Start clean.
+        if state.get("leader") != self.leader_address or state.get("venue", "paper") != self.venue_name:
+            # A different leader or venue: the old book means nothing. Start clean.
             self._state_path.rename(self._state_path.with_suffix(f".{int(time.time())}.bak"))
             return
         self.broker.load_state(state.get("broker", {}))
@@ -490,6 +636,7 @@ class CopyTrader:
     def _save(self) -> None:
         state = {
             "leader": self.leader_address,
+            "venue": self.venue_name,
             "broker": self.broker.to_state(),
             "prev_leader": self.prev_leader,
             "waiting": sorted(self.waiting),
@@ -504,7 +651,11 @@ class CopyTrader:
         return self.settings.copy_hip3_fee_bps if dex_of(coin) else self.settings.copy_taker_fee_bps
 
     def _funding(self) -> list[str]:
-        """Charge one hour of funding per elapsed hour boundary (at most one per tick)."""
+        """Charge one hour of funding per elapsed hour boundary (at most one per tick).
+
+        On testnet the exchange charges the real funding; this keeps the
+        ledger's per-trade P&L close to it.
+        """
         hour = int(time.time() // 3600)
         if self.funding_hour is None:
             self.funding_hour = hour
@@ -514,58 +665,112 @@ class CopyTrader:
         self.funding_hour = hour
         notes = []
         for coin in list(self.broker.positions):
-            c = self.client.ctx(coin)
+            c = self.venue.ctx(coin)
             paid = self.broker.apply_funding(coin, c.funding, c.oracle)
             notes.append(f"{coin} funding {paid:+.4f}")
         if notes:
             self.broker.log_event("copy_funding", {"payments": notes})
         return notes
 
+    def _account(self) -> tuple[dict[str, float], float]:
+        """Our positions and equity: the exchange's in testnet mode, the ledger's on paper."""
+        if self.executor is None:
+            marks = {c: self.venue.ctx(c).mid for c in self.broker.positions}
+            equity = self.broker.mark(marks)
+            return {c: p.size for c, p in self.broker.positions.items()}, equity
+        acct = self.venue.leader(self.executor.address)
+        self._reconcile(acct.positions)
+        self.broker.mark({c: self.venue.ctx(c).mid for c in self.broker.positions})
+        self.broker.equity = acct.equity  # the exchange's number, not the ledger's
+        return acct.positions, acct.equity
+
+    def _reconcile(self, actual: dict[str, float]) -> None:
+        for coin in sorted(set(actual) | set(self.broker.positions)):
+            want = actual.get(coin, 0.0)
+            pos = self.broker.positions.get(coin)
+            have = pos.size if pos else 0.0
+            if abs(want - have) > 1e-9 * max(1.0, abs(want)):
+                px = self.venue.ctx(coin).mid if self.venue.has(coin) else (pos.entry if pos else 0.0)
+                self.broker.force_size(coin, want, px)
+                self.broker.log_event("copy_reconcile", {"symbol": coin, "ledger": have, "exchange": want})
+
+    def _execute(self, o: Order, held: float, mid: float) -> tuple[float, float, str]:
+        """Returns ``(filled, price, error)``."""
+        if self.executor is None:
+            slip = self.settings.slippage_bps / 10_000
+            return o.delta, (mid * (1 + slip) if o.delta > 0 else mid * (1 - slip)), ""
+        reduce_only = _sign(o.target) == 0 or (
+            _sign(o.target) == _sign(held) and abs(o.target) < abs(held)
+        )
+        ex = self.executor.place(o.coin, o.delta, reduce_only, mid)
+        return ex.filled, ex.avg_px, ex.error
+
     def tick(self, paused: bool) -> list[str]:
         self.client.new_tick()
+        if self.venue is not self.client:
+            self.venue.new_tick()
         book = self.client.leader(self.leader_address)
         self.leader_equity = book.equity
-        # Mark first, so sizing uses current equity.
-        marks = {c: self.client.ctx(c).mid for c in self.broker.positions}
-        equity = self.broker.mark(marks)
+        mine, equity = self._account()  # before sizing: the ratio uses current equity
         self.ratio = self.settings.copy_scale * equity / book.equity if book.equity > 0 else 0.0
 
+        statuses: list[str] = []
+        listed = {c: s for c, s in book.positions.items() if self.venue.has(c)}
+        for coin in sorted(set(book.positions) - set(listed)):
+            if coin not in self._unlisted:  # say it once, not every poll
+                self.broker.log_event("copy_skip", {"symbol": coin, "reason": f"not listed on {self.venue_name}"})
+            statuses.append(f"{coin} skipped: not listed on {self.venue_name}")
+        self._unlisted = set(book.positions) - set(listed)
+
         orders, skips, self.waiting = plan_orders(
-            leader=book.positions,
+            leader=listed,
             prev_leader=self.prev_leader,
             first_tick=self.first_tick,
-            mine={c: p.size for c, p in self.broker.positions.items()},
+            mine=mine,
             waiting=self.waiting,
             ratio=self.ratio,
-            price=lambda c: self.client.ctx(c).mid,
-            decimals=lambda c: self.client.ctx(c).sz_decimals,
+            price=lambda c: self.venue.ctx(c).mid,
+            decimals=lambda c: self.venue.ctx(c).sz_decimals,
             min_notional=self.settings.copy_min_notional,
             allow_increase=not paused and self.can_increase(),
             max_notional=self.settings.max_leverage * equity,
             sync_on_start=self.settings.copy_sync_on_start,
         )
 
-        statuses: list[str] = []
-        slip = self.settings.slippage_bps / 10_000
         for o in orders:
-            mid = self.client.ctx(o.coin).mid
-            px = mid * (1 + slip) if o.delta > 0 else mid * (1 - slip)
-            closed = self.broker.fill(o.coin, o.delta, px, self._fee_bps(o.coin), o.reason)
+            mid = self.venue.ctx(o.coin).mid
+            filled, px, error = self._execute(o, mine.get(o.coin, 0.0), mid)
+            leader_size = book.positions.get(o.coin, 0.0)
+            if error or abs(filled) <= EPS:
+                reason = error or "nothing filled"
+                self.broker.log_event(
+                    "copy_order_error",
+                    {"symbol": o.coin, "reason": o.reason, "size": o.delta, "error": reason},
+                )
+                line = f"{o.coin} {o.reason} {o.delta:+g} FAILED: {reason}"
+                print(f"[{datetime.now(timezone.utc).isoformat()}] COPY {line}")
+                statuses.append(line)
+                continue
+            closed = self.broker.fill(o.coin, filled, px, self._fee_bps(o.coin), o.reason)
             self.broker.log_event(
                 "copy_fill",
                 {
                     "symbol": o.coin,
+                    "venue": self.venue_name,
                     "reason": o.reason,
-                    "side": "buy" if o.delta > 0 else "sell",
-                    "size": abs(o.delta),
+                    "side": "buy" if filled > 0 else "sell",
+                    "size": abs(filled),
+                    "requested": abs(o.delta),
                     "price": px,
+                    "mid": mid,
                     "target": o.target,
-                    "leader_size": book.positions.get(o.coin, 0.0),
+                    "leader_size": leader_size,
                     "ratio": self.ratio,
                     "equity": self.broker.cash,
                 },
             )
-            line = f"{o.coin} {o.reason} {o.delta:+g} @ {px:g} (leader {book.positions.get(o.coin, 0.0):+g})"
+            partial = "" if abs(filled - o.delta) <= EPS else f" (partial: asked {o.delta:+g})"
+            line = f"{o.coin} {o.reason} {filled:+g} @ {px:g}{partial} (leader {leader_size:+g})"
             print(f"[{datetime.now(timezone.utc).isoformat()}] COPY {line}")
             statuses.append(line)
             for t in closed:
@@ -575,15 +780,19 @@ class CopyTrader:
             statuses.append(f"{s.coin} skipped: {s.reason}")
 
         statuses += self._funding()
-        self.prev_leader = dict(book.positions)
+        self.prev_leader = dict(listed)
         self.first_tick = False
-        self.broker.mark({c: self.client.ctx(c).mid for c in self.broker.positions})
+        if self.executor is not None and orders:
+            mine, _ = self._account()  # re-read the exchange after trading
+        else:
+            mine = {c: p.size for c, p in self.broker.positions.items()} if self.executor is None else mine
+            if self.executor is None:
+                self.broker.mark({c: self.venue.ctx(c).mid for c in self.broker.positions})
         self._save()
 
-        for coin, size in sorted(book.positions.items()):
-            mine = self.broker.positions.get(coin)
+        for coin, size in sorted(listed.items()):
             note = " (waiting for leader to go flat)" if coin in self.waiting else ""
-            statuses.append(f"{coin} leader {size:+g} me {mine.size if mine else 0:+g}{note}")
+            statuses.append(f"{coin} leader {size:+g} me {mine.get(coin, 0.0):+g}{note}")
         if not book.positions:
             statuses.append("leader flat")
         return statuses
@@ -591,13 +800,34 @@ class CopyTrader:
     def summary(self) -> dict[str, Any]:
         return {
             "leader": self.leader_address,
+            "venue": self.venue_name,
             "leader_equity": round(self.leader_equity, 2),
             "ratio": self.ratio,
             "waiting": sorted(self.waiting),
         }
 
 
+def build_testnet(settings: Settings) -> tuple[CopyClient, TestnetExecutor]:
+    """Venue client and executor for testnet copy trading.
+
+    Only the leader's dexes that also exist on testnet are loaded: testnet lists
+    hundreds of throwaway dexes, and the SDK fetches metadata for each one given.
+    """
+    leader = CopyClient(settings)
+    testnet = CopyClient(settings, url=TESTNET_INFO_URL)
+    on_testnet = set(testnet.all_dexes())
+    dexes = [d for d in leader.dexes() if d in on_testnet]
+    venue = CopyClient(settings, info=testnet.info, dexes=dexes)
+    return venue, TestnetExecutor(settings, dexes)
+
+
 def print_banner(settings: Settings) -> Iterable[str]:
+    if settings.copy_mode == "mirror":
+        yield (
+            f"  mirror: leader={settings.copy_leader} base=${settings.initial_equity:g} x{settings.copy_scale} "
+            f"poll={settings.copy_poll_seconds}s -- every leader fill replayed at its own price, no minimum"
+        )
+        return
     yield f"  copy: leader={settings.copy_leader} scale={settings.copy_scale} poll={settings.copy_poll_seconds}s"
     yield (
         f"        dexes={','.join(settings.copy_dexes)} sync_on_start={settings.copy_sync_on_start} "

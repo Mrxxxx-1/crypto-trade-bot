@@ -5,6 +5,7 @@ Supports both ``MODE=paper`` (simulated fills) and ``MODE=live``
 """
 from __future__ import annotations
 
+from . import keep_awake
 from .bot import FuturesBot
 from .briefing import start_briefing_thread
 from .config import load_settings
@@ -14,7 +15,16 @@ from .telegram_control import start_control_thread
 def main() -> None:
     settings = load_settings()
 
-    if settings.is_live:
+    if settings.is_live and settings.strategy == "copy":
+        if not settings.wallet_address or not settings.private_key:
+            raise RuntimeError("Testnet copy trading requires HL_WALLET_ADDRESS and HL_PRIVATE_KEY")
+        print(
+            "*** TESTNET COPY — real orders on Hyperliquid TESTNET (no real money) ***\n"
+            f"    Wallet : {settings.wallet_address[:8]}…{settings.wallet_address[-4:]}\n"
+            f"    Leader : {settings.copy_leader} (read from mainnet)\n"
+            f"    Scale  : {settings.copy_scale}x  max slippage {settings.copy_max_slippage_bps:g} bps\n"
+        )
+    elif settings.is_live:
         if not settings.wallet_address or not settings.private_key:
             raise RuntimeError(
                 "Live mode requires HL_WALLET_ADDRESS and HL_PRIVATE_KEY in .env"
@@ -27,6 +37,8 @@ def main() -> None:
             f"    Risk/trade: {settings.risk_per_trade_pct}%\n"
             f"    Testnet: {settings.testnet}\n"
         )
+    elif settings.strategy == "copy" and settings.copy_mode == "mirror":
+        print(f"Paper mirror — no real orders. Replaying every fill of {settings.copy_leader}, scaled.")
     elif settings.strategy == "copy":
         print(f"Paper mode — no real orders. Copying {settings.copy_leader} on every perp dex.")
     else:
@@ -59,7 +71,12 @@ def main() -> None:
             )
 
     bot = FuturesBot(settings)
-    bot.run_forever()
+    held = settings.keep_awake and keep_awake.hold()
+    try:
+        bot.run_forever()
+    finally:
+        if held:
+            keep_awake.release()
 
 
 if __name__ == "__main__":

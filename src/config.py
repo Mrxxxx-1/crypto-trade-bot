@@ -42,7 +42,7 @@ def _parse_strategy(raw: str) -> str:
         raise ValueError(
             "STRATEGY=dca has been removed. Use STRATEGY=trend (directional "
             "trading), STRATEGY=hedge (manual catalyst hedge only) or "
-            "STRATEGY=copy (mirror another trader, paper only)."
+            "STRATEGY=copy (mirror another trader, paper or testnet)."
         )
     if name not in STRATEGIES:
         raise ValueError(f"STRATEGY must be one of {STRATEGIES}, got '{raw}'")
@@ -61,6 +61,14 @@ def _parse_direction_mode(raw: str) -> str:
         raise ValueError(
             f"DIRECTION_MODE must be 'static' or 'signal', got '{raw}'"
         )
+    return mode
+
+
+def _parse_copy_mode(raw: str) -> str:
+    """Validate ``COPY_MODE``; a typo must not silently pick the other mode."""
+    mode = (raw or "positions").strip().lower() or "positions"
+    if mode not in ("positions", "mirror"):
+        raise ValueError(f"COPY_MODE must be 'positions' or 'mirror', got '{raw}'")
     return mode
 
 
@@ -151,8 +159,9 @@ class Settings:
     dashboard_demo_mode: bool
     telegram_control_enabled: bool
 
-    # --- Copy trading (STRATEGY=copy, paper only; see src/copy_trade.py) ---
+    # --- Copy trading (STRATEGY=copy, paper or testnet; see src/copy_trade.py) ---
     copy_leader: str = ""                 # address whose perp positions we mirror
+    copy_mode: str = "positions"          # positions = trade like a follower; mirror = exact fill replay (paper)
     copy_poll_seconds: int = 5            # how often the leader is polled
     copy_scale: float = 1.0               # multiplier on the proportional size (our/leader equity)
     copy_sync_on_start: bool = True       # join the leader's already-open positions at startup
@@ -161,6 +170,9 @@ class Settings:
     copy_taker_fee_bps: float = 4.5       # core perps, base taker tier
     copy_hip3_fee_bps: float = 1.0        # builder-dex perps (#1's observed effective rate)
     copy_risk_guards: bool = False        # True: risk halts block increases (exits always follow)
+    copy_max_slippage_bps: float = 100.0  # testnet IOC limit: worst price accepted vs the mid
+
+    keep_awake: bool = False              # Windows: block idle sleep while the bot runs
 
     @property
     def is_live(self) -> bool:
@@ -205,8 +217,13 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    """Load ``.env``, parse every variable with its documented default, return Settings."""
-    load_dotenv()
+    """Load ``.env``, parse every variable with its documented default, return Settings.
+
+    ``ENV_FILE`` points at another file instead (e.g. ``.env.testnet``), so a
+    testnet key never has to share a file with mainnet credentials. Variables
+    already set in the process environment always win over the file.
+    """
+    load_dotenv(os.getenv("ENV_FILE") or None)
 
     symbols = [
         s.strip()
@@ -294,6 +311,7 @@ def load_settings() -> Settings:
         in ("1", "true", "yes"),
 
         copy_leader=os.getenv("COPY_LEADER", "").strip(),
+        copy_mode=_parse_copy_mode(os.getenv("COPY_MODE", "positions")),
         copy_poll_seconds=max(1, _as_int("COPY_POLL_SECONDS", 5)),
         copy_scale=_as_float("COPY_SCALE", 1.0),
         copy_sync_on_start=os.getenv("COPY_SYNC_ON_START", "true").lower() in ("1", "true", "yes"),
@@ -304,4 +322,6 @@ def load_settings() -> Settings:
         copy_taker_fee_bps=_as_float("COPY_TAKER_FEE_BPS", 4.5),
         copy_hip3_fee_bps=_as_float("COPY_HIP3_FEE_BPS", 1.0),
         copy_risk_guards=os.getenv("COPY_RISK_GUARDS", "").lower() in ("1", "true", "yes"),
+        copy_max_slippage_bps=_as_float("COPY_MAX_SLIPPAGE_BPS", 100.0),
+        keep_awake=os.getenv("KEEP_AWAKE", "").lower() in ("1", "true", "yes"),
     )
