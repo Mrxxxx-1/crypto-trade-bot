@@ -13,7 +13,7 @@ from typing import List
 
 from dotenv import load_dotenv
 
-STRATEGIES = ("trend", "hedge")
+STRATEGIES = ("trend", "hedge", "copy")
 MARGIN_MODES = ("isolated", "cross")
 
 
@@ -41,7 +41,8 @@ def _parse_strategy(raw: str) -> str:
     if name == "dca":
         raise ValueError(
             "STRATEGY=dca has been removed. Use STRATEGY=trend (directional "
-            "trading) or STRATEGY=hedge (manual catalyst hedge only)."
+            "trading), STRATEGY=hedge (manual catalyst hedge only) or "
+            "STRATEGY=copy (mirror another trader, paper only)."
         )
     if name not in STRATEGIES:
         raise ValueError(f"STRATEGY must be one of {STRATEGIES}, got '{raw}'")
@@ -149,6 +150,17 @@ class Settings:
     dashboard_port: int
     dashboard_demo_mode: bool
     telegram_control_enabled: bool
+
+    # --- Copy trading (STRATEGY=copy, paper only; see src/copy_trade.py) ---
+    copy_leader: str = ""                 # address whose perp positions we mirror
+    copy_poll_seconds: int = 5            # how often the leader is polled
+    copy_scale: float = 1.0               # multiplier on the proportional size (our/leader equity)
+    copy_sync_on_start: bool = True       # join the leader's already-open positions at startup
+    copy_dexes: List[str] = ("all",)      # "all", or a list such as core,xyz
+    copy_min_notional: float = 10.0       # Hyperliquid's minimum order value
+    copy_taker_fee_bps: float = 4.5       # core perps, base taker tier
+    copy_hip3_fee_bps: float = 1.0        # builder-dex perps (#1's observed effective rate)
+    copy_risk_guards: bool = False        # True: risk halts block increases (exits always follow)
 
     @property
     def is_live(self) -> bool:
@@ -280,4 +292,16 @@ def load_settings() -> Settings:
         in ("1", "true", "yes"),
         telegram_control_enabled=os.getenv("TELEGRAM_CONTROL_ENABLED", "").lower()
         in ("1", "true", "yes"),
+
+        copy_leader=os.getenv("COPY_LEADER", "").strip(),
+        copy_poll_seconds=max(1, _as_int("COPY_POLL_SECONDS", 5)),
+        copy_scale=_as_float("COPY_SCALE", 1.0),
+        copy_sync_on_start=os.getenv("COPY_SYNC_ON_START", "true").lower() in ("1", "true", "yes"),
+        copy_dexes=[
+            s.strip().lower() for s in os.getenv("COPY_DEXES", "all").split(",") if s.strip()
+        ] or ["all"],
+        copy_min_notional=_as_float("COPY_MIN_NOTIONAL", 10.0),
+        copy_taker_fee_bps=_as_float("COPY_TAKER_FEE_BPS", 4.5),
+        copy_hip3_fee_bps=_as_float("COPY_HIP3_FEE_BPS", 1.0),
+        copy_risk_guards=os.getenv("COPY_RISK_GUARDS", "").lower() in ("1", "true", "yes"),
     )

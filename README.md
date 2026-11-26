@@ -15,6 +15,7 @@ hedge-only mode:
 |-----------|--------------|
 | `trend` (default) | EMA/ATR trend-following, described below. The only strategy that trades on its own. |
 | `hedge` | Trades nothing. Services only the [manual catalyst hedge](#catalyst-hedge-manual-and-opt-in). |
+| `copy` | Mirrors another trader's perp positions on every dex. [Paper only](#strategycopy--paper-copy-trading). |
 
 A symbol listed in `SHORT_SYMBOLS` trades the mirror (short) logic; everything
 else is long. You can instead set
@@ -95,6 +96,43 @@ BTC/USDC:USDC   last=77,910.00
 Backtest (22 months, 4h BTC/ETH, `STRATEGY=trend`): **+11.7%** return, **1.27**
 profit factor, **16.4%** max drawdown — a ~35% win rate with average win ≈ 2.4×
 average loss. Backtested, not live; figures depend on the window and parameters.
+
+### `STRATEGY=copy` — paper copy trading
+
+Mirrors one trader's perp positions into a paper account. Pick the trader with
+[`leader_scan`](#4b-score-traders-to-copy-research-only). `MODE=live` refuses to start:
+live order routing for copy trading isn't built.
+
+```powershell
+$env:MODE="paper"; $env:STRATEGY="copy"; $env:COPY_LEADER="0x..."; $env:LOGS_DIR="logs/copy"
+python -m src.main
+```
+
+Every `COPY_POLL_SECONDS` the bot reads the leader's positions on the core book **and every
+HIP-3 builder dex** (`xyz:` stocks and indices, etc.). For each coin whose position changed, it
+trades to `leader_size × COPY_SCALE × (our equity ÷ leader equity)`.
+
+| Behaviour | Why |
+|---|---|
+| Trades only when the leader's size changes | Both equities move every tick. Chasing the exact ratio would churn fees; reacting to their trades reproduces them one for one. |
+| Joins open positions at startup (`COPY_SYNC_ON_START`) | `false` instead ignores them until the leader is next flat in that coin. |
+| Closes any coin the leader doesn't hold | A restart or a missed poll can never leave you exposed to something they aren't. |
+| Skips orders under `COPY_MIN_NOTIONAL` ($10) | Hyperliquid would reject them live. A position that would shrink below it closes instead. |
+| Pause and `COPY_RISK_GUARDS` block increases only | Reductions, closes and flips always follow. `COPY_RISK_GUARDS=false` (default) follows exactly. |
+| `MAX_LEVERAGE` caps total notional ÷ equity | Proportional copying reproduces the leader's *account* leverage, which is usually far below this cap. |
+
+**Paper fills** happen at the dex mid ± `SLIPPAGE_BPS` and pay `COPY_TAKER_FEE_BPS` (core) or
+`COPY_HIP3_FEE_BPS` (builder dexes). Hourly funding accrues at the live rate. Liquidation is not
+simulated. State (positions, cash, last-seen leader book) persists in `LOGS_DIR/copy_state.json`,
+so a restart resumes instead of re-buying. Switching `COPY_LEADER` archives the old state and
+starts clean.
+
+**Size matters.** At $10k against a $4.6M leader the ratio is about 0.2%, so any leader order
+under about $4.6k is below the $10 minimum and gets skipped (logged as `copy_skip`). Raise
+`INITIAL_EQUITY` to see a closer copy.
+
+**Not copied:** spot holdings and vault deposits. Leverage *settings* are not mirrored either;
+only the position sizes are, which determine actual exposure.
 
 ### Entry-quality filters (opt-in)
 
@@ -467,6 +505,7 @@ src/
   backtest.py       Offline backtester on cached candle data
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
   leader_scan.py    Score leaderboard traders as copy-trading candidates (read-only)
+  copy_trade.py     STRATEGY=copy: mirror a leader across all perp dexes (paper ledger)
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)
   agent_tools.py    Single registry of agent-callable tools (read + pause/resume only)

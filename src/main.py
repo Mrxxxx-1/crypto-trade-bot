@@ -27,6 +27,8 @@ def main() -> None:
             f"    Risk/trade: {settings.risk_per_trade_pct}%\n"
             f"    Testnet: {settings.testnet}\n"
         )
+    elif settings.strategy == "copy":
+        print(f"Paper mode — no real orders. Copying {settings.copy_leader} on every perp dex.")
     else:
         print(f"Paper mode — no real orders. Symbols: {settings.symbols}")
 
