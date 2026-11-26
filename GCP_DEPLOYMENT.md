@@ -462,6 +462,11 @@ Or use CI/CD (section 13): push to `main` and GitHub Actions runs the same steps
 Push to `main` runs **CI** (compile + import smoke test), then **deploys** to your VM
 over SSH. Pull requests only run CI.
 
+The deploy job is **off by default**: it runs only when the repository variable
+`DEPLOY_ENABLED` is `true` (Settings → Secrets and variables → Actions → Variables).
+Set it once the VM is up; delete it when the VM is shut down, so pushes to `main`
+don't fail trying to reach a server that isn't there.
+
 ### One-time setup
 
 **On the VM** (if not already done): clone the repo, create `.env`, enable
