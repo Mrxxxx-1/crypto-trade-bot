@@ -55,6 +55,113 @@ STATE_FILE = "copy_state.json"
 EPS = 1e-12
 
 
+# --------------------------------------------------------------- terminal text
+# ASCII only ("->", not an arrow): a redirected Windows console is cp1252.
+
+
+def stamp(now: Optional[datetime] = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def side_text(size: float) -> str:
+    if abs(size) <= EPS:
+        return "flat"
+    return f"{'long' if size > 0 else 'short'} {abs(size):g}"
+
+
+def usd(x: float) -> str:
+    a = abs(x)
+    if a >= 1e6:
+        return f"${a / 1e6:.2f}M"
+    if a >= 1e4:
+        return f"${a / 1e3:.1f}k"
+    return f"${a:,.2f}"
+
+
+def signed_usd(x: float) -> str:
+    return ("+" if x >= 0 else "-") + usd(x)
+
+
+def leader_move(prev: float, now: float, first: bool) -> str:
+    """What the leader did to one coin, e.g. ``leader bought 50 -> long 250``."""
+    if first:
+        return f"leader {side_text(now)} (joining)"
+    d = now - prev
+    if abs(d) <= EPS:
+        return f"leader {side_text(now)}"
+    return f"leader {'bought' if d > 0 else 'sold'} {abs(d):g} -> {side_text(now)}"
+
+
+@dataclass
+class Tally:
+    copied: int = 0
+    skipped: int = 0
+    failed: int = 0
+    slip_bps: float = 0.0  # summed over copied fills; positive = worse than mid
+
+    def text(self) -> str:
+        avg = self.slip_bps / self.copied if self.copied else 0.0
+        return (
+            f"copied {self.copied}  skipped {self.skipped}  failed {self.failed}  avg slip {avg:.1f} bps"
+        )
+
+
+@dataclass
+class CopyStats:
+    """The terminal's scorecard: our return against the leader's, since start and per UTC day.
+
+    The leader's return is their account-value change, so a deposit or
+    withdrawal by them shows up as a jump in the gap.
+    """
+
+    started_at: str = ""
+    start_equity: float = 0.0
+    leader_start: float = 0.0
+    day: str = ""
+    day_equity: float = 0.0
+    day_leader: float = 0.0
+    total: Tally = field(default_factory=Tally)
+    today: Tally = field(default_factory=Tally)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CopyStats":
+        d = dict(d)
+        total, today = Tally(**d.pop("total", {})), Tally(**d.pop("today", {}))
+        return cls(**d, total=total, today=today)
+
+    def begin(self, equity: float, leader_equity: float, now: datetime) -> None:
+        if self.started_at or equity <= 0 or leader_equity <= 0:
+            return
+        self.started_at = now.isoformat()
+        self.start_equity, self.leader_start = equity, leader_equity
+        self.day = now.strftime("%Y-%m-%d")
+        self.day_equity, self.day_leader = equity, leader_equity
+
+    def roll(self, equity: float, leader_equity: float, now: datetime) -> Optional[str]:
+        """At the first tick of a new UTC day: that day's summary line, then reset."""
+        day = now.strftime("%Y-%m-%d")
+        if not self.day or day == self.day:
+            return None
+        line = (
+            f"DAILY {self.day}: {score(equity, leader_equity, self.day_equity, self.day_leader)}"
+            f" | {self.today.text()}"
+        )
+        self.day, self.day_equity, self.day_leader, self.today = day, equity, leader_equity, Tally()
+        return line
+
+    def count(self, kind: str, slip_bps: float = 0.0) -> None:
+        for t in (self.total, self.today):
+            setattr(t, kind, getattr(t, kind) + 1)
+            if kind == "copied":
+                t.slip_bps += slip_bps
+
+
+def score(equity: float, leader_equity: float, base: float, leader_base: float) -> str:
+    me = (equity / base - 1) * 100 if base else 0.0
+    them = (leader_equity / leader_base - 1) * 100 if leader_base else 0.0
+    return f"me {me:+.2f}%  leader {them:+.2f}%  gap {me - them:+.2f}%"
+
+
 def dex_of(coin: str) -> str:
     """``xyz:NVDA`` -> ``xyz``; core coins -> ``""``."""
     return coin.split(":", 1)[0] if ":" in coin else ""
@@ -147,6 +254,7 @@ class CopyClient:
                         "leverage": (p.get("leverage") or {}).get("value"),
                         "margin": (p.get("leverage") or {}).get("type"),
                         "value": float(p.get("positionValue") or 0),
+                        "upnl": float(p.get("unrealizedPnl") or 0),
                     }
         spot = self.info.post({"type": "spotClearinghouseState", "user": address}) or {}
         equity += sum(float(b.get("total", 0) or 0) for b in spot.get("balances", []) if b.get("coin") in STABLES)
@@ -615,6 +723,11 @@ class CopyTrader:
         self.leader_equity = 0.0
         self.ratio = 0.0
         self._unlisted: set[str] = set()
+        self.stats = CopyStats()
+        self.changed = False  # this tick traded, skipped or rolled the day: show status now
+        self._book = LeaderBook(0.0, {})
+        self._mine: dict[str, float] = {}
+        self._mine_details: dict[str, dict[str, Any]] = {}
         self._state_path = Path(settings.logs_dir) / STATE_FILE
         self._load()
 
@@ -631,6 +744,8 @@ class CopyTrader:
         self.prev_leader = {c: float(s) for c, s in state.get("prev_leader", {}).items()}
         self.waiting = set(state.get("waiting", []))
         self.funding_hour = state.get("funding_hour")
+        if state.get("stats"):
+            self.stats = CopyStats.from_dict(state["stats"])
         self.first_tick = False
 
     def _save(self) -> None:
@@ -641,6 +756,7 @@ class CopyTrader:
             "prev_leader": self.prev_leader,
             "waiting": sorted(self.waiting),
             "funding_hour": self.funding_hour,
+            "stats": asdict(self.stats),
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._state_path.with_suffix(".tmp")
@@ -679,6 +795,7 @@ class CopyTrader:
             equity = self.broker.mark(marks)
             return {c: p.size for c, p in self.broker.positions.items()}, equity
         acct = self.venue.leader(self.executor.address)
+        self._mine_details = acct.details
         self._reconcile(acct.positions)
         self.broker.mark({c: self.venue.ctx(c).mid for c in self.broker.positions})
         self.broker.equity = acct.equity  # the exchange's number, not the ledger's
@@ -705,7 +822,15 @@ class CopyTrader:
         ex = self.executor.place(o.coin, o.delta, reduce_only, mid)
         return ex.filled, ex.avg_px, ex.error
 
+    def _say(self, coin: str, text: str) -> str:
+        """Print one copy event now (not at the next status) and return it for the log."""
+        line = f"{coin:<12} {text}"
+        print(f"[{stamp()}] COPY {line}")
+        self.changed = True
+        return line
+
     def tick(self, paused: bool) -> list[str]:
+        self.changed = False
         self.client.new_tick()
         if self.venue is not self.client:
             self.venue.new_tick()
@@ -715,12 +840,25 @@ class CopyTrader:
         self.ratio = self.settings.copy_scale * equity / book.equity if book.equity > 0 else 0.0
 
         statuses: list[str] = []
+        now = datetime.now(timezone.utc)
+        self.stats.begin(equity, book.equity, now)
+        daily = self.stats.roll(equity, book.equity, now)
+        if daily:
+            print(f"[{stamp(now)}] {daily}")
+            self.broker.log_event("copy_daily", {"summary": daily})
+            self.changed = True
+            statuses.append(daily)
+
         listed = {c: s for c, s in book.positions.items() if self.venue.has(c)}
-        for coin in sorted(set(book.positions) - set(listed)):
+        unlisted = set(book.positions) - set(listed)
+        for coin in sorted(unlisted):
+            reason = f"not listed on {self.venue_name}"
             if coin not in self._unlisted:  # say it once, not every poll
-                self.broker.log_event("copy_skip", {"symbol": coin, "reason": f"not listed on {self.venue_name}"})
-            statuses.append(f"{coin} skipped: not listed on {self.venue_name}")
-        self._unlisted = set(book.positions) - set(listed)
+                self.broker.log_event("copy_skip", {"symbol": coin, "reason": reason})
+                self.stats.count("skipped")
+                self._say(coin, f"leader {side_text(book.positions[coin])} | skipped: {reason}")
+            statuses.append(f"{coin} skipped: {reason}")
+        self._unlisted = unlisted
 
         orders, skips, self.waiting = plan_orders(
             leader=listed,
@@ -736,10 +874,15 @@ class CopyTrader:
             max_notional=self.settings.max_leverage * equity,
             sync_on_start=self.settings.copy_sync_on_start,
         )
+        first = self.first_tick
+
+        def move(coin: str) -> str:
+            return leader_move(self.prev_leader.get(coin, 0.0), listed.get(coin, 0.0), first)
 
         for o in orders:
             mid = self.venue.ctx(o.coin).mid
-            filled, px, error = self._execute(o, mine.get(o.coin, 0.0), mid)
+            held = mine.get(o.coin, 0.0)
+            filled, px, error = self._execute(o, held, mid)
             leader_size = book.positions.get(o.coin, 0.0)
             if error or abs(filled) <= EPS:
                 reason = error or "nothing filled"
@@ -747,11 +890,11 @@ class CopyTrader:
                     "copy_order_error",
                     {"symbol": o.coin, "reason": o.reason, "size": o.delta, "error": reason},
                 )
-                line = f"{o.coin} {o.reason} {o.delta:+g} FAILED: {reason}"
-                print(f"[{datetime.now(timezone.utc).isoformat()}] COPY {line}")
-                statuses.append(line)
+                self.stats.count("failed")
+                statuses.append(self._say(o.coin, f"{move(o.coin)} | {o.reason} {o.delta:+g} FAILED: {reason}"))
                 continue
             closed = self.broker.fill(o.coin, filled, px, self._fee_bps(o.coin), o.reason)
+            slip = (px - mid) / mid * 10_000 * _sign(filled) if mid else 0.0
             self.broker.log_event(
                 "copy_fill",
                 {
@@ -763,21 +906,29 @@ class CopyTrader:
                     "requested": abs(o.delta),
                     "price": px,
                     "mid": mid,
+                    "slip_bps": slip,
                     "target": o.target,
                     "leader_size": leader_size,
                     "ratio": self.ratio,
                     "equity": self.broker.cash,
                 },
             )
-            partial = "" if abs(filled - o.delta) <= EPS else f" (partial: asked {o.delta:+g})"
-            line = f"{o.coin} {o.reason} {filled:+g} @ {px:g}{partial} (leader {leader_size:+g})"
-            print(f"[{datetime.now(timezone.utc).isoformat()}] COPY {line}")
-            statuses.append(line)
+            self.stats.count("copied", slip)
+            partial = "" if abs(filled - o.delta) <= EPS else f" (partial, asked {abs(o.delta):g})"
+            verb = "bought" if filled > 0 else "sold"
+            statuses.append(
+                self._say(
+                    o.coin,
+                    f"{move(o.coin)} | we {verb} {abs(filled):g} @ {px:g}{partial} "
+                    f"({slip:.1f} bps slip) -> {side_text(held + filled)}",
+                )
+            )
             for t in closed:
                 self.on_trade_close(t)
         for s in skips:
             self.broker.log_event("copy_skip", {"symbol": s.coin, "reason": s.reason})
-            statuses.append(f"{s.coin} skipped: {s.reason}")
+            self.stats.count("skipped")
+            statuses.append(self._say(s.coin, f"{move(s.coin)} | skipped: {s.reason}"))
 
         statuses += self._funding()
         self.prev_leader = dict(listed)
@@ -788,6 +939,7 @@ class CopyTrader:
             mine = {c: p.size for c, p in self.broker.positions.items()} if self.executor is None else mine
             if self.executor is None:
                 self.broker.mark({c: self.venue.ctx(c).mid for c in self.broker.positions})
+        self._book, self._mine = book, mine
         self._save()
 
         for coin, size in sorted(listed.items()):
@@ -797,6 +949,50 @@ class CopyTrader:
             statuses.append("leader flat")
         return statuses
 
+    def heartbeat_lines(self, paused: bool = False) -> list[str]:
+        """The periodic terminal status: scorecard, then one line per coin, leader vs us."""
+        s = self.stats
+        eq = self.broker.equity
+        since = s.started_at[5:16].replace("T", " ") + "Z" if s.started_at else "-"
+        head = (
+            f"[{stamp()}] STATUS equity {usd(eq)} | "
+            f"{score(eq, self.leader_equity, s.start_equity, s.leader_start)} since {since} | {s.total.text()}"
+        )
+        if paused:
+            head += " [PAUSED: increases not followed]"
+        lines = [head]
+        book = self._book
+        held = {c for c, v in self._mine.items() if abs(v) > EPS}
+        for coin in sorted(set(book.positions) | held):
+            lsize = book.positions.get(coin, 0.0)
+            lead = f"leader {side_text(lsize)}"
+            if abs(lsize) > EPS:
+                d = book.details.get(coin, {})
+                value = d.get("value", 0.0)
+                pct = value / self.leader_equity * 100 if self.leader_equity else 0.0
+                lev = f", {d['leverage']}x" if d.get("leverage") else ""
+                lead += f" ({usd(value)}, {pct:.1f}%{lev})"
+            size = self._mine.get(coin, 0.0)
+            me = f"me {side_text(size)}"
+            if abs(size) > EPS:
+                mark = self.broker.marks.get(coin, 0.0)
+                live = self._mine_details.get(coin) if self.executor is not None else None
+                if live:
+                    value, upnl = live.get("value", abs(size) * mark), live.get("upnl", 0.0)
+                else:
+                    pos = self.broker.positions.get(coin)
+                    value, upnl = abs(size) * mark, (pos.unrealized(mark) if pos else 0.0)
+                pct = value / eq * 100 if eq else 0.0
+                me += f" ({usd(value)}, {pct:.1f}%) uPnL {signed_usd(upnl)}"
+            if coin in self._unlisted:
+                me += f" (not listed on {self.venue_name})"
+            elif coin in self.waiting:
+                me += " (waiting for leader to go flat)"
+            lines.append(f"  {coin:<12} {lead:<40} | {me}")
+        if len(lines) == 1:
+            lines.append("  leader flat, nothing held")
+        return lines
+
     def summary(self) -> dict[str, Any]:
         return {
             "leader": self.leader_address,
@@ -804,6 +1000,7 @@ class CopyTrader:
             "leader_equity": round(self.leader_equity, 2),
             "ratio": self.ratio,
             "waiting": sorted(self.waiting),
+            "stats": asdict(self.stats),
         }
 
 

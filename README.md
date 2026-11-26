@@ -210,6 +210,30 @@ copy trading never sends mainnet orders.
 doesn't hold, including ones you opened by hand. If HIP-3 (`xyz:` etc.) orders fail with a margin
 error, that dex's collateral isn't set up for your testnet account. Core coins keep working.
 
+#### Reading the copy bot's terminal
+
+Copy mode (paper or testnet) doesn't print the trend bot's `HEARTBEAT`. It prints three kinds of
+line:
+
+```
+[2026-11-26 04:31:02Z] COPY ETH          leader bought 50 -> long 250 | we bought 0.0386 @ 1733.1 (4.0 bps slip) -> long 0.1929
+[2026-11-26 04:31:40Z] COPY xyz:NVDA     leader bought 3 -> long 13 | skipped: order $6.12 below $10 minimum
+[2026-11-26 04:35:00Z] STATUS equity $445.65 | me +0.04%  leader +0.05%  gap -0.01% since 11-26 04:21Z | copied 3  skipped 1  failed 0  avg slip 6.0 bps
+  ETH          leader long 200 ($339.3k, 7.4%, 20x)     | me long 0.1543 ($267.40, 60.0%) uPnL +$0.12
+[2026-11-27 00:00:04Z] DAILY 2026-11-26: me +0.40%  leader +0.35%  gap +0.05% | copied 4  skipped 2  failed 0  avg slip 5.0 bps
+```
+
+- **COPY**: one line the moment the leader changes a position. It shows what the leader did and
+  what the bot did about it: filled (with slippage against the mid), skipped (and why) or FAILED.
+- **STATUS**: printed every `COPY_STATUS_SECONDS` (default 300) and right after any COPY line.
+  `gap` is your return minus the leader's since the bot first started on this `LOGS_DIR`. The
+  leader's return is their account-value change, so their deposits and withdrawals show up in it.
+  Each coin's `%` is its size as a share of that account's equity, so with `COPY_SCALE=10` yours
+  is about 10 times theirs.
+- **DAILY**: at the first tick after midnight UTC, the previous day's returns and counts.
+
+The scorecard is kept in `copy_state.json`, so it survives restarts.
+
 ### Keeping the PC awake
 
 `KEEP_AWAKE=true` makes the bot ask Windows not to idle-sleep while it runs

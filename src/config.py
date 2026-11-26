@@ -171,6 +171,7 @@ class Settings:
     copy_hip3_fee_bps: float = 1.0        # builder-dex perps (#1's observed effective rate)
     copy_risk_guards: bool = False        # True: risk halts block increases (exits always follow)
     copy_max_slippage_bps: float = 100.0  # testnet IOC limit: worst price accepted vs the mid
+    copy_status_seconds: int = 300        # terminal STATUS every N seconds (and after every trade)
 
     keep_awake: bool = False              # Windows: block idle sleep while the bot runs
 
@@ -313,6 +314,7 @@ def load_settings() -> Settings:
         copy_leader=os.getenv("COPY_LEADER", "").strip(),
         copy_mode=_parse_copy_mode(os.getenv("COPY_MODE", "positions")),
         copy_poll_seconds=max(1, _as_int("COPY_POLL_SECONDS", 5)),
+        copy_status_seconds=max(0, _as_int("COPY_STATUS_SECONDS", 300)),
         copy_scale=_as_float("COPY_SCALE", 1.0),
         copy_sync_on_start=os.getenv("COPY_SYNC_ON_START", "true").lower() in ("1", "true", "yes"),
         copy_dexes=[

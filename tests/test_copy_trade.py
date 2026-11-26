@@ -8,9 +8,11 @@ ledger's accounting, then the trader end to end against a fake leader.
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from src.copy_trade import (
@@ -199,7 +201,7 @@ class FakeClient:
         pass
 
     def leader(self, address):
-        return LeaderBook(self.book.equity, dict(self.book.positions))
+        return LeaderBook(self.book.equity, dict(self.book.positions), dict(self.book.details))
 
     def ctx(self, coin):
         if coin not in self.px:
@@ -372,6 +374,94 @@ class TestTestnetTrader(unittest.TestCase):
         skips = [e for e in self.events("copy_skip") if "not listed" in e["reason"]]
         self.assertEqual(len(skips), 1)
         self.assertIn("ETH", t.broker.positions)
+
+
+class TestTerminalLog(unittest.TestCase):
+    """What the terminal says: one line per leader action, and a scorecard against the leader."""
+
+    LEADER = "0x" + "ab" * 20
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.settings = make_settings(
+            STRATEGY="copy", COPY_LEADER=self.LEADER, LOGS_DIR=self.tmp.name, INITIAL_EQUITY=10_000,
+            COPY_TAKER_FEE_BPS=0, COPY_HIP3_FEE_BPS=0, SLIPPAGE_BPS=0, MAX_LEVERAGE=50,
+        )
+        self.client = FakeClient()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def trader(self):
+        return CopyTrader(self.settings, CopyPaperBroker(self.settings), client=self.client)
+
+    def tick(self, t):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            t.tick(paused=False)
+        return out.getvalue()
+
+    def test_each_leader_action_gets_one_line(self):
+        t = self.trader()
+        self.client.book.positions = {"ETH": 100.0}
+        out = self.tick(t)
+        self.assertIn("leader long 100 (joining) | we bought 1 @ 2000 (0.0 bps slip) -> long 1", out)
+        self.assertTrue(t.changed)
+
+        self.assertEqual(self.tick(t), "")  # nothing happened: nothing printed
+        self.assertFalse(t.changed)
+
+        self.client.book.positions = {"ETH": 150.0}
+        out = self.tick(t)
+        self.assertIn("leader bought 50 -> long 150 | we bought 0.5 @ 2000 (0.0 bps slip) -> long 1.5", out)
+
+        self.client.book.positions = {"ETH": 150.2}  # $4 for us: under the $10 minimum
+        out = self.tick(t)
+        self.assertIn("leader bought 0.2 -> long 150.2 | skipped: order $4.00 below $10 minimum", out)
+        self.assertEqual((t.stats.total.copied, t.stats.total.skipped), (2, 1))
+        out.encode("ascii")  # a redirected Windows console is cp1252
+
+    def test_status_compares_our_return_with_the_leaders(self):
+        t = self.trader()
+        self.client.book.positions = {"ETH": 100.0}
+        self.client.book.details = {"ETH": {"value": 200_000.0, "leverage": 20}}
+        self.tick(t)
+        self.client.book.equity = 1_100_000.0  # leader +10%, we are flat
+        self.tick(t)
+        head, *rows = t.heartbeat_lines()
+        self.assertIn("me +0.00%  leader +10.00%  gap -10.00%", head)
+        self.assertIn("copied 1  skipped 0  failed 0", head)
+        self.assertIn("leader long 100 ($200.0k, 18.2%, 20x)", rows[0])
+        self.assertIn("me long 1 ($2,000.00, 20.0%) uPnL +$0.00", rows[0])
+
+    def test_new_utc_day_prints_yesterdays_summary_and_resets_it(self):
+        t = self.trader()
+        self.client.book.positions = {"ETH": 100.0}
+        self.tick(t)
+        t.stats.day = "2000-01-01"
+        out = self.tick(t)
+        self.assertIn("DAILY 2000-01-01: me +0.00%  leader +0.00%  gap +0.00% | copied 1", out)
+        self.assertTrue(t.changed)
+        self.assertEqual(t.stats.today.copied, 0)
+        self.assertEqual(t.stats.total.copied, 1)
+
+    def test_scorecard_survives_restart(self):
+        t = self.trader()
+        self.client.book.positions = {"ETH": 100.0}
+        self.tick(t)
+        t2 = self.trader()
+        self.assertEqual(t2.stats.started_at, t.stats.started_at)
+        self.assertEqual(t2.stats.total.copied, 1)
+
+    def test_testnet_slippage_is_measured_against_mid(self):
+        venue = FakeVenue(equity=1_000.0)
+        s = make_settings(STRATEGY="copy", MODE="live", HL_TESTNET="true", COPY_LEADER=self.LEADER,
+                          LOGS_DIR=self.tmp.name, MAX_LEVERAGE=50)
+        t = CopyTrader(s, CopyPaperBroker(s), client=self.client, venue=venue, executor=FakeExecutor(venue))
+        self.client.book.positions = {"ETH": 1000.0}
+        out = self.tick(t)
+        self.assertIn("(10.0 bps slip)", out)  # FakeExecutor fills 0.1% worse than mid
+        self.assertAlmostEqual(t.stats.total.slip_bps, 10.0)
 
 
 class TestOrderResponse(unittest.TestCase):

@@ -79,6 +79,8 @@ class MirrorTracker:
         self.ticks = 0
         self.fills_mirrored = 0
         self.resyncs = 0
+        self.changed = False  # a fill or resync this tick: show status now
+        self._statuses: list[str] = []
         self._state_path = Path(settings.logs_dir) / STATE_FILE
         self._load()
 
@@ -269,6 +271,8 @@ class MirrorTracker:
 
     def tick(self, paused: bool) -> list[str]:
         self.ticks += 1
+        self.changed = False
+        before = (self.fills_mirrored, self.resyncs)
         statuses: list[str] = []
         book: Optional[LeaderBook] = None
         if self.ratio <= 0:
@@ -298,7 +302,13 @@ class MirrorTracker:
         for coin, size in sorted(self.tracked.items()):
             ours = self.broker.positions.get(coin)
             statuses.append(f"{coin} leader {size:+g} me {ours.size if ours else 0:+.8g}")
+        self.changed = (self.fills_mirrored, self.resyncs) != before
+        self._statuses = statuses
         return statuses
+
+    def heartbeat_lines(self, paused: bool = False) -> list[str]:
+        head = f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}] STATUS equity ${self.broker.equity:,.2f}"
+        return [head] + [f"  {s}" for s in self._statuses]
 
     def summary(self) -> dict[str, Any]:
         return {

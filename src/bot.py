@@ -277,11 +277,16 @@ class FuturesBot:
 
     def run_forever(self) -> None:
         """Main loop: process all symbols, sleep, log heartbeats."""
-        print(
-            f"[{self._utc_now()}] Start bot mode={self.settings.mode} "
-            f"symbols={self.settings.symbols} strategy={self.settings.strategy} "
-            f"timeframe={self.settings.timeframe}"
-        )
+        if self.copy is not None:  # symbols and timeframe mean nothing to a copy bot
+            venue = "testnet" if self.settings.is_live else "paper"
+            print(f"[{self._utc_now()}] Start copy bot venue={venue} copy_mode={self.settings.copy_mode}")
+        else:
+            print(
+                f"[{self._utc_now()}] Start bot mode={self.settings.mode} "
+                f"symbols={self.settings.symbols} strategy={self.settings.strategy} "
+                f"timeframe={self.settings.timeframe}"
+            )
+        last_status = 0.0
         if self.settings.strategy == "trend":
             print(
                 f"  trend: fast_ema={self.settings.fast_ema} slow_ema={self.settings.slow_ema} "
@@ -323,15 +328,22 @@ class FuturesBot:
                 hedge_status = self._poll_hedge()
                 if hedge_status:
                     statuses.append(f"hedge: {hedge_status}")
+                if self.copy is not None and (
+                    self.copy.changed or time.monotonic() - last_status >= self.settings.copy_status_seconds
+                ):
+                    for line in self.copy.heartbeat_lines(self.paused):
+                        print(line)
+                    last_status = time.monotonic()
                 if self.loop_count % self.settings.heartbeat_interval == 0:
-                    print(
-                        f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
-                        f"equity={self.broker.equity:.2f} "
-                        f"open_positions={len(self.broker.positions)}"
-                        f"{' [PAUSED]' if self.paused else ''}"
-                    )
-                    for status in statuses:
-                        print(f"  - {status}")
+                    if self.copy is None:
+                        print(
+                            f"[{self._utc_now()}] HEARTBEAT loop={self.loop_count} "
+                            f"equity={self.broker.equity:.2f} "
+                            f"open_positions={len(self.broker.positions)}"
+                            f"{' [PAUSED]' if self.paused else ''}"
+                        )
+                        for status in statuses:
+                            print(f"  - {status}")
                     snapshot = {
                         "loop": self.loop_count,
                         "equity": self.broker.equity,
