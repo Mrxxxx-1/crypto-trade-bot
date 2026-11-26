@@ -220,7 +220,7 @@ class FakeVenue(FakeClient):
         self.account = LeaderBook(equity=equity, positions={})
 
     def leader(self, address):
-        return LeaderBook(self.account.equity, dict(self.account.positions))
+        return LeaderBook(self.account.equity, dict(self.account.positions), dict(self.account.details))
 
 
 class FakeExecutor:
@@ -231,6 +231,12 @@ class FakeExecutor:
         self.fill_fraction = fill_fraction
         self.error = error
         self.calls = []
+        self.leverage_calls = []
+        self.leverage_error = ""
+
+    def set_leverage(self, coin, leverage, cross):
+        self.leverage_calls.append((coin, leverage, cross))
+        return self.leverage_error
 
     def place(self, coin, delta, reduce_only, mid):
         self.calls.append((coin, delta, reduce_only))
@@ -462,6 +468,116 @@ class TestTerminalLog(unittest.TestCase):
         out = self.tick(t)
         self.assertIn("(10.0 bps slip)", out)  # FakeExecutor fills 0.1% worse than mid
         self.assertAlmostEqual(t.stats.total.slip_bps, 10.0)
+
+    def test_trade_records_carry_the_exchange_equity_on_testnet(self):
+        venue = FakeVenue(equity=1_000.0)
+        s = make_settings(STRATEGY="copy", MODE="live", HL_TESTNET="true", COPY_LEADER=self.LEADER,
+                          LOGS_DIR=self.tmp.name, MAX_LEVERAGE=50, INITIAL_EQUITY=10_000)
+        t = CopyTrader(s, CopyPaperBroker(s), client=self.client, venue=venue, executor=FakeExecutor(venue))
+        self.client.book.positions = {"ETH": 1000.0}
+        self.tick(t)
+        venue.account.equity = 990.0
+        self.client.book.positions = {}
+        self.tick(t)
+        rec = json.loads((Path(self.tmp.name) / "trades.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(rec["equity"], 990.0)  # not the ledger's $10k starting cash
+
+    def test_unified_account_margin_is_not_counted_twice(self):
+        from src.copy_trade import CopyClient
+
+        class Info:
+            WEIGHTS: dict = {}
+
+            def post(self, body):
+                if body["type"] == "clearinghouseState":
+                    return {"marginSummary": {"accountValue": "326.94"}, "assetPositions": []}
+                return {"balances": [{"coin": "USDC", "total": "358.78", "hold": "326.77"}]}
+
+        c = CopyClient(self.settings, info=Info(), dexes=[""])
+        self.assertAlmostEqual(c.leader("0x1").equity, 358.95)  # not 685.72
+
+    def test_gap_is_measured_against_the_scaled_leader_return(self):
+        from src.copy_trade import score
+        line = score(10_115.0, 1_000_500.0, 10_000.0, 1_000_000.0, scale=10)
+        self.assertEqual(line, "me +1.15%  leader +0.05% (x10 = +0.50%)  gap +0.65%")
+        self.assertEqual(score(101.0, 101.0, 100.0, 100.0), "me +1.00%  leader +1.00%  gap +0.00%")
+
+
+
+class TestLeverageMatching(unittest.TestCase):
+    LEADER = "0x" + "ab" * 20
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.settings = make_settings(STRATEGY="copy", MODE="live", HL_TESTNET="true", COPY_LEADER=self.LEADER,
+                                      LOGS_DIR=self.tmp.name, MAX_LEVERAGE=50)
+        self.client = FakeClient()
+        self.venue = FakeVenue(equity=1_000.0)
+        self.ex = FakeExecutor(self.venue)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def tick(self, t):
+        with redirect_stdout(io.StringIO()) as out:
+            t.tick(paused=False)
+        return out.getvalue()
+
+    def trader(self):
+        return CopyTrader(self.settings, CopyPaperBroker(self.settings), client=self.client,
+                          venue=self.venue, executor=self.ex)
+
+    def test_sets_the_leaders_leverage_once_before_trading(self):
+        t = self.trader()
+        self.client.book.positions = {"ETH": 1000.0}
+        self.client.book.details = {"ETH": {"leverage": 20, "margin": "cross"}}
+        out = self.tick(t)
+        self.assertEqual(self.ex.leverage_calls, [("ETH", 20, True)])
+        self.assertIn("leader 20x cross | leverage set to 20x cross", out)
+        self.assertLess(out.index("leverage set"), out.index("we bought"))
+        self.tick(t)
+        self.assertEqual(len(self.ex.leverage_calls), 1)  # not every tick
+
+    def test_raises_leverage_on_a_position_already_held_and_keeps_its_margin_type(self):
+        self.venue.account.positions = {"BTC": 0.0148}
+        self.venue.account.details = {"BTC": {"leverage": 3, "margin": "cross"}}
+        t = self.trader()
+        t.first_tick = False
+        t.prev_leader = {"BTC": 19.0}
+        self.client.book.positions = {"BTC": 19.0}
+        self.client.book.details = {"BTC": {"leverage": 10, "margin": "isolated"}}
+        out = self.tick(t)
+        self.assertEqual(self.ex.leverage_calls, [("BTC", 10, True)])  # cross kept under an open position
+        self.assertIn("(was 3x)", out)
+
+    def test_failure_is_reported_once_and_retried_only_if_the_leader_changes(self):
+        self.ex.leverage_error = "Insufficient margin"
+        t = self.trader()
+        self.client.book.positions = {"ETH": 1000.0}
+        self.client.book.details = {"ETH": {"leverage": 20, "margin": "cross"}}
+        self.assertIn("set leverage 20x cross FAILED: Insufficient margin", self.tick(t))
+        self.tick(t)
+        self.assertEqual(len(self.ex.leverage_calls), 1)
+        self.client.book.details = {"ETH": {"leverage": 25, "margin": "cross"}}
+        self.tick(t)
+        self.assertEqual(self.ex.leverage_calls[-1], ("ETH", 25, True))
+
+    def test_capped_at_the_venues_max(self):
+        self.client.ctx = lambda coin: AssetCtx(mid=PX[coin], oracle=PX[coin], funding=0.0,
+                                                sz_decimals=DEC[coin], max_leverage=10)
+        self.venue.ctx = self.client.ctx
+        t = self.trader()
+        self.client.book.positions = {"ETH": 1000.0}
+        self.client.book.details = {"ETH": {"leverage": 25, "margin": "cross"}}
+        self.tick(t)
+        self.assertEqual(self.ex.leverage_calls, [("ETH", 10, True)])
+
+    def test_paper_mode_never_sets_leverage(self):
+        t = CopyTrader(make_settings(STRATEGY="copy", COPY_LEADER=self.LEADER, LOGS_DIR=self.tmp.name),
+                       CopyPaperBroker(self.settings), client=self.client)
+        self.client.book.positions = {"ETH": 100.0}
+        self.client.book.details = {"ETH": {"leverage": 20, "margin": "cross"}}
+        self.tick(t)  # no executor: nothing to call, nothing raised
 
 
 class TestOrderResponse(unittest.TestCase):

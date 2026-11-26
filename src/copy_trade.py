@@ -137,13 +137,13 @@ class CopyStats:
         self.day = now.strftime("%Y-%m-%d")
         self.day_equity, self.day_leader = equity, leader_equity
 
-    def roll(self, equity: float, leader_equity: float, now: datetime) -> Optional[str]:
+    def roll(self, equity: float, leader_equity: float, now: datetime, scale: float = 1.0) -> Optional[str]:
         """At the first tick of a new UTC day: that day's summary line, then reset."""
         day = now.strftime("%Y-%m-%d")
         if not self.day or day == self.day:
             return None
         line = (
-            f"DAILY {self.day}: {score(equity, leader_equity, self.day_equity, self.day_leader)}"
+            f"DAILY {self.day}: {score(equity, leader_equity, self.day_equity, self.day_leader, scale)}"
             f" | {self.today.text()}"
         )
         self.day, self.day_equity, self.day_leader, self.today = day, equity, leader_equity, Tally()
@@ -156,10 +156,13 @@ class CopyStats:
                 t.slip_bps += slip_bps
 
 
-def score(equity: float, leader_equity: float, base: float, leader_base: float) -> str:
+def score(equity: float, leader_equity: float, base: float, leader_base: float, scale: float = 1.0) -> str:
+    """Our return vs the leader's. At COPY_SCALE != 1 we should make ``scale`` times their
+    return, so the gap is measured against that, not their raw number."""
     me = (equity / base - 1) * 100 if base else 0.0
     them = (leader_equity / leader_base - 1) * 100 if leader_base else 0.0
-    return f"me {me:+.2f}%  leader {them:+.2f}%  gap {me - them:+.2f}%"
+    lead = f"leader {them:+.2f}%" + (f" (x{scale:g} = {them * scale:+.2f}%)" if scale != 1 else "")
+    return f"me {me:+.2f}%  {lead}  gap {me - them * scale:+.2f}%"
 
 
 def dex_of(coin: str) -> str:
@@ -193,6 +196,8 @@ class AssetCtx:
     oracle: float
     funding: float  # hourly rate
     sz_decimals: int
+    max_leverage: int = 0  # 0 = unknown
+    only_isolated: bool = False  # some HIP-3 markets allow isolated margin only
 
 
 class CopyClient:
@@ -257,7 +262,13 @@ class CopyClient:
                         "upnl": float(p.get("unrealizedPnl") or 0),
                     }
         spot = self.info.post({"type": "spotClearinghouseState", "user": address}) or {}
-        equity += sum(float(b.get("total", 0) or 0) for b in spot.get("balances", []) if b.get("coin") in STABLES)
+        # Unified accounts keep perp margin in spot USDC: ``total`` includes it, shown as
+        # ``hold``, and the perp accountValue counts it again. Only the free part is extra.
+        equity += sum(
+            float(b.get("total", 0) or 0) - float(b.get("hold", 0) or 0)
+            for b in spot.get("balances", [])
+            if b.get("coin") in STABLES
+        )
         return LeaderBook(equity=equity, positions=positions, details=details)
 
     def new_tick(self) -> None:
@@ -282,6 +293,8 @@ class CopyClient:
                     oracle=float(c.get("oraclePx") or mid or 0),
                     funding=float(c.get("funding") or 0),
                     sz_decimals=int(u.get("szDecimals", 4)),
+                    max_leverage=int(u.get("maxLeverage") or 0),
+                    only_isolated=bool(u.get("onlyIsolated")),
                 )
             self._ctx[dex] = table
         try:
@@ -346,6 +359,16 @@ class TestnetExecutor:
         except Exception as exc:  # noqa: BLE001 - one failed order must not stop the loop
             return Execution(0.0, 0.0, f"{type(exc).__name__}: {exc}")
         return parse_order_response(resp, is_buy)
+
+    def set_leverage(self, coin: str, leverage: int, cross: bool) -> str:
+        """Set ``coin``'s leverage and margin type. Returns "" on success, else the error."""
+        try:
+            resp = self.exchange.update_leverage(int(leverage), coin, cross)
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+        if isinstance(resp, dict) and resp.get("status") == "ok":
+            return ""
+        return str(resp.get("response") if isinstance(resp, dict) else resp)[:200]
 
 
 def parse_order_response(resp: Any, is_buy: bool) -> Execution:
@@ -516,6 +539,7 @@ class CopyPaperBroker:
         self.logs_dir = Path(settings.logs_dir)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.cash: float = settings.initial_equity
+        self.account_equity: Optional[float] = None  # set from the exchange in testnet mode
         self.equity: float = settings.initial_equity
         self.positions: dict[str, CopyPosition] = {}
         self.marks: dict[str, float] = {}
@@ -605,9 +629,13 @@ class CopyPaperBroker:
         payload["opened_at"] = trade.opened_at.isoformat()
         payload["closed_at"] = trade.closed_at.isoformat()
         payload["funding"] = pos.funding
-        payload["equity"] = self.cash
+        payload["equity"] = self.reported_equity()
         self._write_jsonl("trades.jsonl", payload)
         return trade
+
+    def reported_equity(self) -> float:
+        """The account's equity for logs: the exchange's on testnet, the ledger's cash on paper."""
+        return self.account_equity if self.account_equity is not None else self.cash
 
     def add_funding(self, coin: str, amount: float) -> None:
         """Book a funding payment in USD (+ received, - paid)."""
@@ -728,6 +756,7 @@ class CopyTrader:
         self._book = LeaderBook(0.0, {})
         self._mine: dict[str, float] = {}
         self._mine_details: dict[str, dict[str, Any]] = {}
+        self._leverage: dict[str, tuple[int, bool]] = {}  # coin -> (leverage, cross) last requested
         self._state_path = Path(settings.logs_dir) / STATE_FILE
         self._load()
 
@@ -799,6 +828,7 @@ class CopyTrader:
         self._reconcile(acct.positions)
         self.broker.mark({c: self.venue.ctx(c).mid for c in self.broker.positions})
         self.broker.equity = acct.equity  # the exchange's number, not the ledger's
+        self.broker.account_equity = acct.equity
         return acct.positions, acct.equity
 
     def _reconcile(self, actual: dict[str, float]) -> None:
@@ -810,6 +840,49 @@ class CopyTrader:
                 px = self.venue.ctx(coin).mid if self.venue.has(coin) else (pos.entry if pos else 0.0)
                 self.broker.force_size(coin, want, px)
                 self.broker.log_event("copy_reconcile", {"symbol": coin, "ledger": have, "exchange": want})
+
+    def _match_leverage(self, listed: dict[str, float], book: LeaderBook) -> list[str]:
+        """Testnet: give each coin the leader's leverage (and margin type) before trading it.
+
+        Without this every coin sits at the exchange default (often 3x), so a
+        scaled-up copy of a 10x position ties up ~3 times the margin the leader
+        uses and later adds fail. Capped at the venue's max leverage. The margin
+        type of a coin we already hold is kept: the exchange won't switch it
+        under an open position. Each (leverage, type) is requested once; it is
+        asked again only when the leader's changes.
+        """
+        if self.executor is None:
+            return []
+        notes = []
+        for coin in sorted(listed):
+            d = book.details.get(coin, {})
+            if not d.get("leverage"):
+                continue
+            c = self.venue.ctx(coin)
+            lev = int(d["leverage"])
+            if c.max_leverage:
+                lev = min(lev, c.max_leverage)
+            cross = d.get("margin") != "isolated" and not c.only_isolated
+            mine = self._mine_details.get(coin) or {}
+            have = None
+            if mine.get("leverage"):
+                cross = mine.get("margin") != "isolated"
+                have = (int(mine["leverage"]), cross)
+            want = (lev, cross)
+            if want == have or self._leverage.get(coin) == want:
+                continue
+            self._leverage[coin] = want
+            kind = "cross" if cross else "isolated"
+            err = self.executor.set_leverage(coin, lev, cross)
+            leader = f"leader {d['leverage']}x {d.get('margin') or 'cross'}"
+            if err:
+                self.broker.log_event("copy_leverage_error", {"symbol": coin, "leverage": lev, "cross": cross, "error": err})
+                notes.append(self._say(coin, f"{leader} | set leverage {lev}x {kind} FAILED: {err}"))
+            else:
+                self.broker.log_event("copy_leverage", {"symbol": coin, "leverage": lev, "cross": cross})
+                was = f" (was {have[0]}x)" if have else ""
+                notes.append(self._say(coin, f"{leader} | leverage set to {lev}x {kind}{was}"))
+        return notes
 
     def _execute(self, o: Order, held: float, mid: float) -> tuple[float, float, str]:
         """Returns ``(filled, price, error)``."""
@@ -842,7 +915,7 @@ class CopyTrader:
         statuses: list[str] = []
         now = datetime.now(timezone.utc)
         self.stats.begin(equity, book.equity, now)
-        daily = self.stats.roll(equity, book.equity, now)
+        daily = self.stats.roll(equity, book.equity, now, self.settings.copy_scale)
         if daily:
             print(f"[{stamp(now)}] {daily}")
             self.broker.log_event("copy_daily", {"summary": daily})
@@ -874,6 +947,7 @@ class CopyTrader:
             max_notional=self.settings.max_leverage * equity,
             sync_on_start=self.settings.copy_sync_on_start,
         )
+        statuses += self._match_leverage(listed, book)
         first = self.first_tick
 
         def move(coin: str) -> str:
@@ -910,7 +984,7 @@ class CopyTrader:
                     "target": o.target,
                     "leader_size": leader_size,
                     "ratio": self.ratio,
-                    "equity": self.broker.cash,
+                    "equity": self.broker.reported_equity(),
                 },
             )
             self.stats.count("copied", slip)
@@ -956,7 +1030,7 @@ class CopyTrader:
         since = s.started_at[5:16].replace("T", " ") + "Z" if s.started_at else "-"
         head = (
             f"[{stamp()}] STATUS equity {usd(eq)} | "
-            f"{score(eq, self.leader_equity, s.start_equity, s.leader_start)} since {since} | {s.total.text()}"
+            f"{score(eq, self.leader_equity, s.start_equity, s.leader_start, self.settings.copy_scale)} since {since} | {s.total.text()}"
         )
         if paused:
             head += " [PAUSED: increases not followed]"

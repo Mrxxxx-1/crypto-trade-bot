@@ -226,7 +226,7 @@ line:
 - **COPY**: one line the moment the leader changes a position. It shows what the leader did and
   what the bot did about it: filled (with slippage against the mid), skipped (and why) or FAILED.
 - **STATUS**: printed every `COPY_STATUS_SECONDS` (default 300) and right after any COPY line.
-  `gap` is your return minus the leader's since the bot first started on this `LOGS_DIR`. The
+  `gap` is your return minus the leader's times `COPY_SCALE` (shown as `x10 = ...`), since the bot first started on this `LOGS_DIR`. The
   leader's return is their account-value change, so their deposits and withdrawals show up in it.
   Each coin's `%` is its size as a share of that account's equity, so with `COPY_SCALE=10` yours
   is about 10 times theirs.
