@@ -175,6 +175,47 @@ Use `--env .env` (not the `.env.example` default) so the run uses your live
 parameters. `--set` accepts any setting name; comma-separated lists such as
 `SYMBOLS` and `SHORT_SYMBOLS` are parsed as lists.
 
+### 4b. Score traders to copy (research only)
+
+`src/leader_scan.py` ranks Hyperliquid traders as copy-trading candidates. It only
+reads public data: no credentials, no orders.
+
+```powershell
+python -m src.leader_scan                        # deep-scan 40, report top 10
+python -m src.leader_scan --deep 80 --days 90 --refresh
+```
+
+It writes `data/leader_scan.md` (top N with details and explorer links) and
+`data/leader_scan.json` (every qualifier).
+
+1. **Prefilter** the public leaderboard (cached 12h in `data/`): drop vaults, accounts
+   losing this month or all-time, equity outside `--min-equity`/`--max-equity`, and monthly
+   volume above `--max-turnover` × equity (market makers and scalpers).
+2. **Deep-scan** the best survivors by all-time P&L, rate-limited under Hyperliquid's
+   info-API budget. It reads the account's own equity and open positions, its perp P&L history
+   (drawdown, profitable months) and `--days` of fills (round trips, hold time, maker share).
+3. **Charge a copy cost.** Every fill pays `--copy-cost-bps` (default 5) on its notional:
+   the slippage a follower takes by arriving late. Win rate, profit factor and ROI are all
+   reported *after* this cost.
+4. **Reject** anything a follower can't reproduce:
+
+| Reason | Why |
+|---|---|
+| trades via sub-accounts | The leaderboard sums sub-accounts into the master. When the sub-accounts hold more than the master's own perp and spot-stablecoin equity, the trading happens at other addresses. |
+| own equity below `--min-equity` | The profits were withdrawn. There's nothing left to size against. |
+| too active to copy | More fills in the window than `--max-fills`. |
+| too few round trips | Under `--min-trades`. Not enough data to judge. |
+| holds too short | Median hold under `--min-hold-hours`. Copy delay eats the edge. |
+| mostly maker fills | Over `--max-maker-ratio` of notional rested on the book. That is market making, and a taker copy can't earn it. |
+| unprofitable after copy cost | Its edge is smaller than the delay. |
+
+5. **Score** 0–100: edge (profit factor, 30), monthly consistency (20), drawdown (20),
+   breadth, meaning P&L not concentrated in the best 3 trades (15), and window ROI (15).
+
+Caveats: Hyperliquid samples P&L history every few days, so intraday drawdowns are
+understated. A trader may also be hedged on another exchange you can't see. If a
+candidate runs a vault, the report says so; depositing copies them exactly, with no delay.
+
 ### 5. Run the bot
 
 ```powershell
@@ -425,6 +466,7 @@ src/
   models.py         Shared types: Position, Leg, TradeResult
   backtest.py       Offline backtester on cached candle data
   fetch_candles.py  Download & cache OHLCV from Hyperliquid
+  leader_scan.py    Score leaderboard traders as copy-trading candidates (read-only)
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)
   agent_tools.py    Single registry of agent-callable tools (read + pause/resume only)
