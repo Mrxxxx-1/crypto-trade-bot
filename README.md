@@ -108,9 +108,24 @@ $env:MODE="paper"; $env:STRATEGY="copy"; $env:COPY_LEADER="0x..."; $env:LOGS_DIR
 python -m src.main
 ```
 
-Every `COPY_POLL_SECONDS` the bot reads the leader's positions on the core book **and every
+Each tick the bot reads the leader's positions on the core book **and every
 HIP-3 builder dex** (`xyz:` stocks and indices, etc.). For each coin whose position changed, it
 trades to `leader_size × COPY_SCALE × (our equity ÷ leader equity)`.
+
+**When it ticks.** With `COPY_WS=true` (default) the bot holds a WebSocket subscription to the
+leader's fills (`userFills`). A fill wakes it at once, typically within a second. The REST
+position snapshot is still the only thing it trades on, so a dropped or missed message can't put
+the copy out of sync.
+
+| Situation | Tick interval |
+|---|---|
+| Connected, leader quiet | `COPY_SAFETY_POLL_SECONDS` (30): a slow safety poll |
+| A leader fill | Immediately, but never more than once per `COPY_POLL_SECONDS` (5), so bursts can't flood the API |
+| The minute after a fill, or socket down | `COPY_POLL_SECONDS` |
+
+A disconnect wakes the bot at once and it reconnects with backoff; the terminal prints `WS connected` / `WS disconnected`. `COPY_WS=false` goes back to plain polling every `COPY_POLL_SECONDS`.
+Several bots on one machine share Hyperliquid's 1200-weight-per-minute info limit per IP. The
+slow quiet-time poll is what lets three of them run side by side.
 
 | Behaviour | Why |
 |---|---|
@@ -614,6 +629,7 @@ src/
   leader_scan.py    Score leaderboard traders as copy-trading candidates (read-only)
   copy_trade.py     STRATEGY=copy: mirror a leader across all perp dexes (paper or testnet)
   copy_mirror.py    COPY_MODE=mirror: exact fill-by-fill replica of the leader's P&L
+  copy_ws.py        COPY_WS: WebSocket on the leader's fills that wakes the copy loop
   keep_awake.py     KEEP_AWAKE=true: block Windows idle sleep while the bot runs
   briefing.py       Daily Telegram summary via Gemini (also: python -m src.briefing)
   control.py        Cross-process pause/resume flag (logs/control.json)

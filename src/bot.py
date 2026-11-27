@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
-from . import control, copy_mirror, copy_trade, hedge, hedge_broker, log_hygiene
+from . import control, copy_mirror, copy_trade, copy_ws, hedge, hedge_broker, log_hygiene
 from . import direction as direction_mod
 from .config import Settings
 from .exchange import ExchangeAdapter, LiveBroker, PaperBroker
@@ -77,6 +77,10 @@ class FuturesBot:
                 venue=venue,
                 executor=executor,
             )
+        # Copy mode: a WebSocket on the leader's fills decides when to tick (REST stays the truth).
+        self.fill_trigger: copy_ws.FillTrigger | None = None
+        if self.copy is not None and settings.copy_ws:
+            self.fill_trigger = copy_ws.FillTrigger(settings.copy_leader)
         self.starting_equity = self.broker.equity
         self.risk = RiskManager(settings, starting_equity=self.broker.equity)
         self.loop_count = 0
@@ -299,8 +303,11 @@ class FuturesBot:
         if self.copy is not None:
             for line in copy_trade.print_banner(self.settings):
                 print(line)
+        if self.fill_trigger is not None:
+            self.fill_trigger.start()
         while True:
             try:
+                tick_started = time.monotonic()
                 self.loop_count += 1
                 # Refresh the cross-process pause flag once per tick (cheap file read).
                 prev_paused = self.paused
@@ -357,14 +364,18 @@ class FuturesBot:
                         snapshot["hedge"] = active.to_dict() if active else None
                     if self.copy is not None:
                         snapshot["copy"] = self.copy.summary()
+                        if self.fill_trigger is not None:
+                            snapshot["copy"]["ws"] = self.fill_trigger.status()
                     log_hygiene.write_state_snapshot(
                         self.settings.logs_dir,
                         {"ts": self._utc_now(), "event": "heartbeat", **snapshot},
                     )
                     self.broker.log_event("heartbeat", self._heartbeat_log.thin(snapshot))
-                time.sleep(self._poll_interval())
+                self._wait_next_tick(tick_started)
             except KeyboardInterrupt:
                 print("Stopped by user.")
+                if self.fill_trigger is not None:
+                    self.fill_trigger.stop()
                 break
             except Exception as exc:  # noqa: BLE001
                 print(f"[{self._utc_now()}] ERROR {exc}")
@@ -377,6 +388,20 @@ class FuturesBot:
                     },
                 )
                 time.sleep(max(3, self._poll_interval() // 2))
+
+    def _wait_next_tick(self, tick_started: float) -> None:
+        """Sleep until the next tick. With the fill trigger: wake on a leader fill, but
+        never tick more than once per COPY_POLL_SECONDS; poll slowly only while quiet."""
+        trigger = self.fill_trigger
+        if trigger is None:
+            time.sleep(self._poll_interval())
+            return
+        poll = self.settings.copy_poll_seconds
+        idle = trigger.idle_seconds(poll, self.settings.copy_safety_poll_seconds)
+        if trigger.wait(tick_started + idle - time.monotonic()):
+            time.sleep(max(0.0, tick_started + poll - time.monotonic()))
+        for name, data in trigger.pop_events():
+            self.broker.log_event(name, data)
 
     def _poll_interval(self) -> int:
         return self.settings.copy_poll_seconds if self.copy is not None else self.settings.poll_seconds

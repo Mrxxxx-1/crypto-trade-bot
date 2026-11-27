@@ -162,7 +162,9 @@ class Settings:
     # --- Copy trading (STRATEGY=copy, paper or testnet; see src/copy_trade.py) ---
     copy_leader: str = ""                 # address whose perp positions we mirror
     copy_mode: str = "positions"          # positions = trade like a follower; mirror = exact fill replay (paper)
-    copy_poll_seconds: int = 5            # how often the leader is polled
+    copy_poll_seconds: int = 5            # how often the leader is polled (min gap between ticks with COPY_WS)
+    copy_ws: bool = True                  # wake on the leader's fills via WebSocket (see src/copy_ws.py)
+    copy_safety_poll_seconds: int = 30    # with COPY_WS connected and the leader quiet, poll this often
     copy_scale: float = 1.0               # multiplier on the proportional size (our/leader equity)
     copy_sync_on_start: bool = True       # join the leader's already-open positions at startup
     copy_dexes: List[str] = ("all",)      # "all", or a list such as core,xyz
@@ -314,6 +316,8 @@ def load_settings() -> Settings:
         copy_leader=os.getenv("COPY_LEADER", "").strip(),
         copy_mode=_parse_copy_mode(os.getenv("COPY_MODE", "positions")),
         copy_poll_seconds=max(1, _as_int("COPY_POLL_SECONDS", 5)),
+        copy_ws=os.getenv("COPY_WS", "true").lower() in ("1", "true", "yes"),
+        copy_safety_poll_seconds=max(1, _as_int("COPY_SAFETY_POLL_SECONDS", 30)),
         copy_status_seconds=max(0, _as_int("COPY_STATUS_SECONDS", 300)),
         copy_scale=_as_float("COPY_SCALE", 1.0),
         copy_sync_on_start=os.getenv("COPY_SYNC_ON_START", "true").lower() in ("1", "true", "yes"),

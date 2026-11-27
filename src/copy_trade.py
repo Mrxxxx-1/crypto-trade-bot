@@ -1096,10 +1096,17 @@ def print_banner(settings: Settings) -> Iterable[str]:
     if settings.copy_mode == "mirror":
         yield (
             f"  mirror: leader={settings.copy_leader} base=${settings.initial_equity:g} x{settings.copy_scale} "
-            f"poll={settings.copy_poll_seconds}s -- every leader fill replayed at its own price, no minimum"
+            f"poll={settings.copy_poll_seconds}s ws={'on' if settings.copy_ws else 'off'} "
+            f"-- every leader fill replayed at its own price, no minimum"
         )
         return
-    yield f"  copy: leader={settings.copy_leader} scale={settings.copy_scale} poll={settings.copy_poll_seconds}s"
+    trigger = (
+        f"ws=on (wake on fills, safety poll {settings.copy_safety_poll_seconds}s)" if settings.copy_ws else "ws=off"
+    )
+    yield (
+        f"  copy: leader={settings.copy_leader} scale={settings.copy_scale} "
+        f"poll={settings.copy_poll_seconds}s {trigger}"
+    )
     yield (
         f"        dexes={','.join(settings.copy_dexes)} sync_on_start={settings.copy_sync_on_start} "
         f"min_notional=${settings.copy_min_notional:g} risk_guards={settings.copy_risk_guards}"
